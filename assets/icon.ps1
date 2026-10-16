@@ -1,8 +1,9 @@
 # Draws a dterm icon: green text on a dark rounded square, saved as a multi-size .ico.
-#   powershell -File icon.ps1 -Text ">_" -Out dterm.ico
-#   powershell -File icon.ps1 -Text "D_" -Out dterm-d.ico
-# Then point dterm.rc at the .ico you want and rebuild the resource:  rc.exe /fo dterm.res dterm.rc
-param([string]$Text = ">_", [string]$Out = "dterm.ico")
+#   powershell -File assets\icon.ps1 -Text "D_" -Out icon.ico          (the current icon)
+#   powershell -File assets\icon.ps1 -Text ">_" -Out icon-prompt.ico   (the alternative)
+# Files are written next to this script. Then point dterm.rc at the .ico you want and rebuild
+# the resource from the project root:  rc.exe /fo dterm.res dterm.rc
+param([string]$Text = "D_", [string]$Out = "icon.ico")
 Add-Type -AssemblyName System.Drawing
 $frames = foreach ($s in 256, 48, 32, 16) {
     $bm = New-Object System.Drawing.Bitmap $s, $s

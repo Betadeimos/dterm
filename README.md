@@ -1,6 +1,8 @@
-# dterm
+<p align="center"><img src="assets/icon.png" width="128" alt="dterm icon"></p>
 
-A tiny Windows terminal that puts your shells in a grid.
+<h1 align="center">dterm</h1>
+
+<p align="center">A tiny Windows terminal that puts your shells in a grid.</p>
 
 One native exe (about 320 KB), nothing to configure. Panes run Git Bash, start in your home
 folder, and look like Windows Terminal: acrylic background, One Half Dark colors, Cascadia Mono,
@@ -28,8 +30,9 @@ font fallback for symbols and emoji.
 cargo build --release
 ```
 
-The exe is `target\release\dterm.exe`. The icon comes from the prebuilt `dterm.res`; to change it,
-see `icon.ps1` and `build.rs`.
+The exe is `target\release\dterm.exe`. The icon is linked from the prebuilt `dterm.res`, so the
+build needs no resource compiler. To change it, draw a new one with `assets\icon.ps1`, point
+`dterm.rc` at it and rebuild `dterm.res` (steps in `build.rs`).
 
 ## Status
 
