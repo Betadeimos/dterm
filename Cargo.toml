@@ -2,6 +2,9 @@
 name = "dterm"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+description = "A tiny Windows terminal that puts your shells in a grid"
+repository = "https://github.com/Betadeimos/dterm"
 
 [dependencies]
 alacritty_terminal = "0.26"
