@@ -9,45 +9,45 @@ Windows Terminal, but built around the grid.
 Ordered roughly by how much they hurt today.
 
 ### Selection and clipboard
-- [ ] **Mouse selection.** Drag to select, double-click word, triple-click line.
-- [ ] **Shift+Left/Right selects** character by character (today it types a capital letter / sends
+- [x] **Mouse selection.** Drag to select, double-click word, triple-click line.
+- [x] **Shift+Left/Right selects** character by character (today it types a capital letter / sends
       an escape sequence). Shift+Up/Down extends by line. Like Windows Terminal's mark mode.
-- [ ] **Right-click:** copies when there is a selection, pastes when there is none (Windows Terminal behavior).
-- [ ] **Ctrl+C copies** when there is a selection, otherwise sends interrupt as today.
-- [ ] **Mouse-wheel scrollback** through history.
+- [x] **Right-click:** copies when there is a selection, pastes when there is none (Windows Terminal behavior).
+- [x] **Ctrl+C copies** when there is a selection, otherwise sends interrupt as today.
+- [x] **Mouse-wheel scrollback** through history.
 
 ### Layout and shortcuts
 Windows Terminal defaults in brackets, so muscle memory carries over.
-- [ ] **Alt+Shift+Plus / Alt+Shift+Minus split the focused pane**, exactly like WT:
+- [x] **Alt+Shift+Plus / Alt+Shift+Minus split the focused pane**, exactly like WT:
       Plus = new pane to the right, Minus = new pane below.
       Moving from the auto-grid to real splits means a split tree instead of rows/cols fractions.
-- [ ] **Alt+Shift+arrows resize the focused pane** by a fixed step [WT: same].
-- [ ] **Ctrl+Alt+arrows swap** the focused pane with its neighbour [WT: swapPane, unbound by default].
-- [ ] **Zoom** the focused pane to fill the window, and back to the grid [WT: togglePaneZoom, unbound].
-- [ ] **Grid ⇄ tabs toggle.** One shortcut (and one small button) switches the same sessions
+- [x] **Alt+Shift+arrows resize the focused pane** by a fixed step [WT: same].
+- [x] **Ctrl+Alt+arrows swap** the focused pane with its neighbour [WT: swapPane, unbound by default].
+- [x] **Zoom** the focused pane to fill the window, and back to the grid [WT: togglePaneZoom, unbound].
+- [x] **Grid ⇄ tabs toggle.** One shortcut (and one small button) switches the same sessions
       between the grid and tab view. WT can't do this: panes and tabs are separate there.
-- [ ] Ctrl+Shift+W closes the focused pane [WT: same].
-- [ ] Keep Ctrl+Shift+T (add pane, auto grid) and Alt+arrows (move focus, done).
+- [x] Ctrl+Shift+W closes the focused pane [WT: same].
+- [x] Keep Ctrl+Shift+T (add pane, auto grid) and Alt+arrows (move focus, done).
 
 ### Knowing which pane is which
-- [ ] **Focus indicator:** a very faint border on the focused pane and slightly dimmer unfocused
+- [x] **Focus indicator:** a very faint border on the focused pane and slightly dimmer unfocused
       panes. Subtle, no accent-colour frame. [WT uses an accent-colour border.]
-- [ ] **Pane names without headers:** a small, low-contrast label in the pane's top-right corner
+- [x] **Pane names without headers:** a small, low-contrast label in the pane's top-right corner
       (folder name by default, or the title the shell/app sets via OSC 0/2, or a name you type).
       Fades while you type in that pane. No title bars, no chrome.
 
 ### Sessions
-- [ ] **Session restore + landing page.** On start, a terminal-style menu (like opencode):
+- [x] **Session restore + landing page.** On start, a terminal-style menu (like opencode):
       new session / last session / saved sessions. A session stores the layout, pane names and each
       pane's working directory. [WT: `persistedWindowLayout` restores layout and directories, not contents.]
 - [ ] Optionally save scrollback text per pane so a restored session shows what was there.
 
 ### Look
-- [ ] **Keep the acrylic when the window is unfocused.** Today Windows swaps the backdrop for a solid
+- [x] **Keep the acrylic when the window is unfocused.** Today Windows swaps the backdrop for a solid
       colour when inactive (DWMSBT_TRANSIENTWINDOW behavior). Needs a different backdrop method,
       e.g. drawing our own blur, or the accent-policy API.
-- [ ] **Ctrl+Plus / Ctrl+Minus / Ctrl+0 change the font size** [WT: same].
-- [ ] Cosmetic: highlighted text (inverse/background colours) shows thin dark lines between rows.
+- [x] **Ctrl+Plus / Ctrl+Minus / Ctrl+0 change the font size** [WT: same].
+- [x] Cosmetic: highlighted text (inverse/background colours) shows thin dark lines between rows.
       Snap cell rectangles to whole pixels so backgrounds join seamlessly like in WT.
 
 ## Where Windows Terminal stands (checked October 2026)

@@ -14,6 +14,8 @@
 //! Ctrl+Shift+G (or the button in the top-right corner, shown when the mouse is near the top edge)
 //! shows the panes as tabs in a strip instead; click a tab, press Ctrl+Tab or Alt+Left/Right to switch,
 //! and use the button at the right end of the strip (or Ctrl+Shift+G) to get the grid back.
+//! Closing the window remembers the session (layout, folders, names, view, font); Ctrl+Shift+S saves
+//! it under a name. With anything saved, dterm starts on a landing page to pick one or a new session.
 
 use std::{
     borrow::Cow,
@@ -49,6 +51,7 @@ use windows::{
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
             Ole::CF_UNICODETEXT,
             Registry::*,
+            Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
         },
         UI::{Controls::{MARGINS, WM_MOUSELEAVE}, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     },
@@ -85,6 +88,15 @@ const TAB_SIZE: f32 = 12.0; // DIPs
 const TAB_ACTIVE_ALPHA: f32 = 0.9; // name of the active tab; inactive ones use LABEL_ALPHA, hovered LABEL_FOCUS_ALPHA
 const UNDERLINE_ALPHA: f32 = 0.6; // underline of the active tab
 const REVEAL: f32 = 36.0; // DIPs from the top edge where the view button shows up in the grid
+const LAND_X: f32 = 48.0; // DIPs, where the landing page's text starts
+const LAND_Y: f32 = 56.0;
+const LAND_ROWS: f32 = LAND_Y + 130.0; // first choice, below the logo and tagline
+const LOGO_SIZE: f32 = 44.0; // DIPs
+const PREVIEW: (f32, f32) = (320.0, 200.0); // DIPs, the selected session's layout
+const PROMPT_MAX: usize = 40; // characters of a typed session name
+const TOAST_TIMER: usize = 1; // hides the "saved" note
+const GREEN: u32 = 0x98C379; // One Half Dark green, as in the icon
+const RED: u32 = 0xE06C75;
 const PALETTE: [u32; 16] = [
     0x282C34, 0xE06C75, 0x98C379, 0xE5C07B, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xDCDFE4,
     0x5A6374, 0xE06C75, 0x98C379, 0xE5C07B, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xDCDFE4,
@@ -203,6 +215,7 @@ fn halves((x, y, w, h): Rect, side_by_side: bool, ratio: f32) -> (Rect, Rect) {
 }
 
 /// How the panes are laid out: a binary tree whose leaves are pane ids.
+#[derive(Debug, PartialEq)]
 enum Node {
     Leaf(usize),
     /// `a` left of `b` when `side_by_side`, else `a` above `b`; `ratio` is `a`'s share of the extent.
@@ -214,6 +227,20 @@ impl Node {
         match self {
             Node::Leaf(i) => *i == id,
             Node::Split { a, b, .. } => a.has(id) || b.has(id),
+        }
+    }
+
+    /// The same tree with its leaves numbered `next`, `next + 1`, ... in tree order.
+    fn numbered(&self, next: &mut usize) -> Node {
+        match self {
+            Node::Leaf(_) => {
+                *next += 1;
+                Node::Leaf(*next - 1)
+            }
+            Node::Split { side_by_side, ratio, a, b } => {
+                let a = Box::new(a.numbered(next));
+                Node::Split { side_by_side: *side_by_side, ratio: *ratio, a, b: Box::new(b.numbered(next)) }
+            }
         }
     }
 
@@ -470,6 +497,236 @@ fn zoomed(size: f32, step: i32) -> f32 {
     if step == 0 { FONT_SIZE } else { (size + step as f32).clamp(8.0, 40.0) }
 }
 
+/// A saved session: the split tree (its leaves index `panes`, in tree order), each pane's folder
+/// and typed name (either may be empty), the view, the font size, the focused pane's index, and
+/// when the session was started and last saved (Unix seconds, 0 = unknown).
+#[derive(Debug, PartialEq)]
+struct Session {
+    view: View,
+    font: f32,
+    focus: usize,
+    tree: Node,
+    panes: Vec<(String, String)>,
+    created: u64,
+    closed: u64,
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Local (year, month, day, hour, minute) of Unix time `t`.
+fn local_time(t: u64) -> Option<(u16, u16, u16, u16, u16)> {
+    let ticks = (t + 11_644_473_600) * 10_000_000; // FILETIME counts 100 ns since 1601
+    let ft = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let (mut utc, mut local) = (SYSTEMTIME::default(), SYSTEMTIME::default());
+    unsafe {
+        FileTimeToSystemTime(&ft, &mut utc).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc, &mut local).ok()?;
+    }
+    Some((local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute))
+}
+
+/// `t` for people: "today 15:42", "yesterday 09:10", "16 Oct 14:02", or "16 Oct 2025" in another year.
+fn when((y, mo, d, h, mi): (u16, u16, u16, u16, u16), today: (u16, u16, u16), yesterday: (u16, u16, u16)) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let month = MONTHS[(mo.clamp(1, 12) - 1) as usize];
+    match (y, mo, d) {
+        t if t == today => format!("today {h:02}:{mi:02}"),
+        t if t == yesterday => format!("yesterday {h:02}:{mi:02}"),
+        _ if y == today.0 => format!("{d} {month} {h:02}:{mi:02}"),
+        _ => format!("{d} {month} {y}"),
+    }
+}
+
+/// `when` for Unix time `t` against the local clock; empty when unknown.
+fn ago(t: u64) -> String {
+    let day = |t: u64| local_time(t).map(|(y, m, d, _, _)| (y, m, d));
+    match (t > 0).then(|| local_time(t)).flatten() {
+        Some(at) => when(at, day(now()).unwrap_or_default(), day(now().saturating_sub(86_400)).unwrap_or_default()),
+        None => String::new(),
+    }
+}
+
+/// Session file text: a header, then the tree in pre-order (a `split` line is followed by its two children).
+fn session_text(s: &Session) -> String {
+    fn node(n: &Node, panes: &[(String, String)], out: &mut String) {
+        match n {
+            Node::Leaf(i) => {
+                let (cwd, name) = panes.get(*i).map_or(("", ""), |(c, n)| (c.as_str(), n.as_str()));
+                let clean = |t: &str| t.replace(['\t', '\r', '\n'], " ");
+                out.push_str(&format!("pane {}\t{}\n", clean(cwd), clean(name)));
+            }
+            Node::Split { side_by_side, ratio, a, b } => {
+                out.push_str(&format!("split {} {ratio:.3}\n", if *side_by_side { "side" } else { "stack" }));
+                node(a, panes, out);
+                node(b, panes, out);
+            }
+        }
+    }
+    let view = match s.view {
+        View::Grid => "grid",
+        View::Zoom => "zoom",
+        View::Tabs => "tabs",
+    };
+    let mut out = format!(
+        "dterm-session 1\nview {view}\nfont {}\nfocus {}\ncreated {}\nclosed {}\n",
+        s.font, s.focus, s.created, s.closed
+    );
+    node(&s.tree, &s.panes, &mut out);
+    out
+}
+
+/// The session in `session_text` form, or `None` when anything is off.
+fn parse_session(text: &str) -> Option<Session> {
+    fn node<'a>(lines: &mut impl Iterator<Item = &'a str>, panes: &mut Vec<(String, String)>, depth: usize) -> Option<Node> {
+        let line = lines.next()?;
+        if let Some(rest) = line.strip_prefix("pane ") {
+            let (cwd, name) = rest.split_once('\t').unwrap_or((rest, ""));
+            panes.push((cwd.trim().into(), name.trim().into()));
+            return Some(Node::Leaf(panes.len() - 1));
+        }
+        let mut parts = line.strip_prefix("split ")?.split(' ');
+        let side_by_side = match parts.next()? {
+            "side" => true,
+            "stack" => false,
+            _ => return None,
+        };
+        let ratio: f32 = parts.next()?.parse().ok()?;
+        if depth > 64 || !(0.0..=1.0).contains(&ratio) {
+            return None;
+        }
+        let a = Box::new(node(lines, panes, depth + 1)?);
+        let b = Box::new(node(lines, panes, depth + 1)?);
+        Some(Node::Split { side_by_side, ratio: ratio.clamp(MIN, 1.0 - MIN), a, b })
+    }
+    let text = text.trim_start_matches('\u{feff}'); // a byte-order mark, as some editors save
+    let mut lines = text.lines().map(|l| l.trim_end_matches('\r')).filter(|l| !l.trim().is_empty()).peekable();
+    if lines.next()? != "dterm-session 1" {
+        return None;
+    }
+    let view = match lines.next()?.strip_prefix("view ")? {
+        "grid" => View::Grid,
+        "zoom" => View::Zoom,
+        "tabs" => View::Tabs,
+        _ => return None,
+    };
+    let font: f32 = lines.next()?.strip_prefix("font ")?.parse().ok()?;
+    let focus: usize = lines.next()?.strip_prefix("focus ")?.parse().ok()?;
+    // Optional: files from before the timestamps have neither line.
+    let mut stamp = |key: &str| lines.next_if(|l| l.starts_with(key)).and_then(|l| l[key.len()..].parse().ok()).unwrap_or(0);
+    let (created, closed) = (stamp("created "), stamp("closed "));
+    let mut panes = Vec::new();
+    let tree = node(&mut lines, &mut panes, 0)?;
+    if lines.next().is_some() {
+        return None;
+    }
+    Some(Session { view, font: font.clamp(8.0, 40.0), focus: focus.min(panes.len() - 1), tree, panes, created, closed })
+}
+
+/// File name (without extension) for a session saved as `name`: letters, digits, space, `-`, `_`.
+fn session_file_name(name: &str) -> Option<String> {
+    let kept: String = name.chars().filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_')).collect();
+    let kept = kept.trim();
+    (!kept.is_empty()).then(|| kept.into())
+}
+
+/// Where sessions live: `%APPDATA%\dterm` (`last.session`, and `sessions\<name>.session`).
+fn data_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA").map(|d| std::path::PathBuf::from(d).join("dterm"))
+}
+
+/// One choice on the landing page. `file` and `session` are `None` for a new session; `saved`
+/// ones can be deleted. `created` / `closed` are ready to show ("today 15:42"), empty if unknown.
+struct Choice {
+    label: String,
+    detail: String,
+    created: String,
+    closed: String,
+    file: Option<std::path::PathBuf>,
+    session: Option<Session>,
+    saved: bool,
+}
+
+/// The landing page: its choices, the selected one, and whether Del was pressed once on it.
+struct Landing {
+    rows: Vec<Choice>,
+    sel: usize,
+    armed: bool,
+}
+
+fn pane_count(n: usize) -> String {
+    format!("{n} pane{}", if n == 1 { "" } else { "s" })
+}
+
+/// The landing page's choices: new session, the last one, then saved ones by name. Unreadable
+/// files are left out. `stamp` turns a Unix time into words (see `ago`).
+fn landing_rows(dir: &std::path::Path, stamp: &dyn Fn(u64) -> String) -> Vec<Choice> {
+    let read = |f: &std::path::Path| std::fs::read_to_string(f).ok().and_then(|t| parse_session(&t));
+    let choice = |label: String, s: Session, file, saved| Choice {
+        label,
+        detail: pane_count(s.panes.len()),
+        created: stamp(s.created),
+        closed: stamp(s.closed),
+        file: Some(file),
+        session: Some(s),
+        saved,
+    };
+    let new = Choice {
+        label: "New session".into(),
+        detail: String::new(),
+        created: String::new(),
+        closed: String::new(),
+        file: None,
+        session: None,
+        saved: false,
+    };
+    let mut rows = vec![new];
+    let last = dir.join("last.session");
+    if let Some(s) = read(&last) {
+        rows.push(choice("Last session".into(), s, last, false));
+    }
+    let mut saved: Vec<Choice> = std::fs::read_dir(dir.join("sessions"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|f| f.extension().is_some_and(|x| x == "session"))
+        .filter_map(|f| {
+            let s = read(&f)?;
+            let label = f.file_stem()?.to_string_lossy().into_owned();
+            Some(choice(label, s, f, true))
+        })
+        .collect();
+    saved.sort_by_key(|c| c.label.to_lowercase());
+    rows.extend(saved);
+    rows
+}
+
+/// Landing page geometry: the logo and tagline sit above `LAND_ROWS`, where the choices start,
+/// one every `line_h` DIPs.
+fn landing_row(y: f32, line_h: f32, rows: usize) -> Option<usize> {
+    let at = (y - LAND_ROWS) / line_h;
+    (at >= 0.0 && (at as usize) < rows).then_some(at as usize)
+}
+
+/// Height of one landing page row for cells `cell_h` DIPs tall.
+fn land_line(cell_h: f32) -> f32 {
+    cell_h + 12.0
+}
+
+/// A preview name for a saved pane: its typed name, else its folder ("~" for home or unknown).
+fn preview_name((cwd, name): &(String, String), home: Option<&str>) -> String {
+    if !name.is_empty() {
+        return name.clone();
+    }
+    let cwd = cwd.trim_end_matches(['\\', '/']);
+    if cwd.is_empty() || home.is_some_and(|h| h.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(cwd)) {
+        return "~".into();
+    }
+    cwd.rsplit(['\\', '/']).next().unwrap_or(cwd).into()
+}
+
 /// Grid point and cell half under `(x, y)` DIPs, for text starting at `origin` in a `size`
 /// (columns, lines) terminal scrolled back `offset` lines. Clamped to the grid.
 fn locate(
@@ -582,6 +839,8 @@ impl Names {
                 self.cwd = Some(dir.into());
                 self.win = win_path(dir);
             }
+            // The console's first title is the shell's own path (…\bash.exe): not a name.
+            None if title.is_some_and(|t| t.to_ascii_lowercase().ends_with(".exe")) => self.app = None,
             None => self.app = title.map(Into::into),
         }
     }
@@ -734,6 +993,10 @@ struct App {
     view: View,
     mouse: Option<(f32, f32)>,   // last mouse position in DIPs; None once it left the window
     tracking: bool,              // WM_MOUSELEAVE is requested
+    landing: Option<Landing>,    // the start page, shown before any pane exists
+    prompt: Option<String>,      // session name being typed for Ctrl+Shift+S
+    toast: Option<String>,       // short note after saving
+    created: u64,                // when this session started (Unix seconds), kept across restores
 }
 
 impl App {
@@ -761,6 +1024,24 @@ impl App {
         if let Some(i) = self.panes.iter().position(|p| p.id == id) {
             self.focus = i;
         }
+    }
+
+    /// What a session file stores about the current window; `None` without panes.
+    fn session(&self) -> Option<Session> {
+        let tree = self.tree.as_ref()?;
+        let order = tree.ids();
+        let panes = order
+            .iter()
+            .map(|id| {
+                let p = self.panes.iter().find(|p| p.id == *id);
+                let cwd = p.and_then(|p| p.names.lock().ok()?.win.clone()).unwrap_or_default();
+                (cwd, p.and_then(|p| p.custom.clone()).unwrap_or_default())
+            })
+            .collect();
+        let focused = self.panes.get(self.focus).map(|p| p.id);
+        let focus = order.iter().position(|&i| Some(i) == focused).unwrap_or(0);
+        let tree = tree.numbered(&mut 0);
+        Some(Session { view: self.view, font: self.font_size, focus, tree, panes, created: self.created, closed: now() })
     }
 
     /// Move the focus `step` panes along the tree order, wrapping.
@@ -805,11 +1086,13 @@ fn window_size((cols, lines): (usize, usize), cell: (f32, f32), scale: f32) -> W
     }
 }
 
-fn spawn(hwnd: HWND, id: usize, bash: &str, cell: (f32, f32), scale: f32) -> std::io::Result<Pane> {
+/// A new pane running Git Bash in folder `dir` (the home folder when `None` or gone).
+fn spawn(hwnd: HWND, id: usize, bash: &str, cell: (f32, f32), scale: f32, dir: Option<&str>) -> std::io::Result<Pane> {
     let size = (80, 24); // layout() fits it to the pane right away
+    let dir = dir.map(std::path::PathBuf::from).filter(|d| d.is_dir());
     let opts = tty::Options {
         shell: Some(tty::Shell::new(bash.into(), vec!["--login".into(), "-i".into()])),
-        working_directory: std::env::var_os("USERPROFILE").map(Into::into),
+        working_directory: dir.or_else(|| std::env::var_os("USERPROFILE").map(Into::into)),
         drain_on_exit: false,
         env: Default::default(),
         escape_args: true,
@@ -900,7 +1183,7 @@ unsafe fn add_pane(hwnd: HWND, dir: Option<bool>) {
     let added = with(|a| {
         let id = a.next_id;
         a.next_id += 1;
-        let Ok(p) = spawn(hwnd, id, &a.bash, a.cell, s) else { return false };
+        let Ok(p) = spawn(hwnd, id, &a.bash, a.cell, s, None) else { return false };
         let (at, side_by_side) = match dir {
             Some(d) => (a.focus, d),
             None => auto_split(&a.panes.iter().map(|p| p.rect).collect::<Vec<_>>(), a.focus),
@@ -976,6 +1259,14 @@ unsafe fn paint(hwnd: HWND) {
         }
         let (rt, brush) = a.target.as_ref().unwrap();
         rt.BeginDraw();
+        if let Some(l) = &a.landing {
+            rt.Clear(Some(&color(rgb(BG), OPACITY)));
+            draw_landing(a, l, rt, brush, w as f32 / s);
+            if rt.EndDraw(None, None).is_err() {
+                a.target = None;
+            }
+            return;
+        }
         rt.Clear(Some(&color(rgb(GAP_COLOR), 0.9)));
         let (several, labeled) = (a.view == View::Grid && a.panes.len() > 1, a.labeled());
         for (i, p) in a.panes.iter().enumerate().filter(|&(i, _)| a.is_shown(i)) {
@@ -1006,10 +1297,100 @@ unsafe fn paint(hwnd: HWND) {
             rt.PopAxisAlignedClip();
         }
         draw_chrome(a, rt, brush, w as f32 / s);
+        // The Ctrl+Shift+S prompt, or the note after saving: one small line near the bottom.
+        let note = a.prompt.as_ref().map(|t| (format!("save session as: {t}\u{258f}"), 0.9)).or(a.toast.clone().map(|t| (t, 0.6)));
+        if let Some((text, alpha)) = note {
+            let (cw, ch) = (w as f32 / s, h as f32 / s);
+            let bw = 380f32.min(cw - 16.0);
+            let r = rect((cw - bw) / 2.0, ch - 56.0, bw, 30.0);
+            brush.SetColor(&color(rgb(BG), 0.95));
+            rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 6.0, radiusY: 6.0 }, brush);
+            brush.SetColor(&color(rgb(FG), alpha));
+            let units: Vec<u16> = text.encode_utf16().collect();
+            rt.DrawText(&units, &a.tab, &r, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+        }
         if rt.EndDraw(None, None).is_err() {
             a.target = None; // device lost: recreate on the next paint
         }
     });
+}
+
+/// The landing page, terminal style: the logo, the choices (the selected one bright with a green
+/// ❯), and a hint line.
+unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, width: f32) {
+    let (cw, ch) = a.cell;
+    let lh = land_line(ch);
+    let text = |s: &str, f: &IDWriteTextFormat, r: D2D_RECT_F, c: u32, alpha: f32| {
+        brush.SetColor(&color(rgb(c), alpha));
+        let units: Vec<u16> = s.encode_utf16().collect();
+        rt.DrawText(&units, f, &r, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+    };
+    // Line `y` of terminal text, vertically centered in its row.
+    let line = |s: &str, x: f32, y: f32, c: u32, alpha: f32| text(s, &a.format, rect(x, y + (lh - ch) / 2.0, 4000.0, ch), c, alpha);
+
+    // The logo, as on the icon, and a tagline.
+    if let Ok(big) = text_format(&a.dw, DWRITE_FONT_WEIGHT_BOLD, LOGO_SIZE) {
+        let r = rect(LAND_X, LAND_Y, 4000.0, LOGO_SIZE * 1.4);
+        text("D_", &big, r, GREEN, 1.0);
+        text("   dterm", &big, r, FG, 0.95); // monospace: three cells to the right of "D_"
+    }
+    line("terminals in a grid, sessions that come back", LAND_X + 2.0, LAND_Y + LOGO_SIZE * 1.45, FG, 0.4);
+
+    // The choices: label, pane count, when it was last closed.
+    let chars = |f: fn(&Choice) -> &String| l.rows.iter().map(|r| f(r).chars().count()).max().unwrap_or(0) as f32;
+    let (lw, dw) = (chars(|r| &r.label), chars(|r| &r.detail));
+    let closed_x = LAND_X + (6.0 + lw + dw) * cw;
+    let list_w = (closed_x - LAND_X) + (chars(|r| &r.closed) + 9.0) * cw;
+    for (i, row) in l.rows.iter().enumerate() {
+        let y = LAND_ROWS + i as f32 * lh;
+        let on = i == l.sel;
+        if on {
+            brush.SetColor(&color(rgb(FG), 0.07));
+            let bar = D2D1_ROUNDED_RECT { rect: rect(LAND_X - 12.0, y, list_w + 12.0, lh), radiusX: 6.0, radiusY: 6.0 };
+            rt.FillRoundedRectangle(&bar, brush);
+            line("\u{276f}", LAND_X, y, GREEN, 1.0);
+        }
+        line(&row.label, LAND_X + 2.0 * cw, y, FG, if on { 1.0 } else { 0.6 });
+        line(&row.detail, LAND_X + (4.0 + lw) * cw, y, FG, if on { 0.6 } else { 0.4 });
+        if !row.closed.is_empty() {
+            line(&format!("closed {}", row.closed), closed_x, y, FG, if on { 0.5 } else { 0.3 });
+        }
+    }
+
+    // What the selected choice opens: its layout in miniature, with each pane's name.
+    let px = LAND_X + list_w + 48.0;
+    let Some(row) = l.rows.get(l.sel) else { return };
+    if px + PREVIEW.0 <= width - 24.0 {
+        let one = Node::Leaf(0);
+        let fresh = [(String::new(), String::new())];
+        let (tree, panes) = row.session.as_ref().map_or((&one, &fresh[..]), |s| (&s.tree, &s.panes[..]));
+        for (i, (x, y, w, h)) in tree.rects((px, LAND_ROWS, PREVIEW.0, PREVIEW.1)) {
+            let r = rect(x, y, w, h);
+            let pane = D2D1_ROUNDED_RECT { rect: r, radiusX: 4.0, radiusY: 4.0 };
+            brush.SetColor(&color(rgb(BG), 0.6));
+            rt.FillRoundedRectangle(&pane, brush);
+            brush.SetColor(&color(rgb(FG), 0.18));
+            rt.DrawRoundedRectangle(&pane, brush, 1.0, None);
+            let name = if row.session.is_some() { preview_name(&panes[i], a.home.as_deref()) } else { "Git Bash \u{b7} ~".into() };
+            text(&name, &a.tab, r, FG, 0.65);
+        }
+        let caption = match (row.created.as_str(), row.closed.as_str()) {
+            ("", "") => "a fresh shell in your home folder".to_string(),
+            ("", c) => format!("closed {c}"),
+            (s, "") => format!("started {s}"),
+            (s, c) => format!("started {s}  \u{b7}  closed {c}"),
+        };
+        text(&caption, &a.tab, rect(px - 60.0, LAND_ROWS + PREVIEW.1 + 8.0, PREVIEW.0 + 120.0, 24.0), FG, 0.4);
+    }
+
+    // Keys, or the delete question.
+    let y = LAND_ROWS + (l.rows.len() as f32 + 1.0) * lh;
+    if l.armed {
+        line(&format!("press Del again to delete \u{201c}{}\u{201d}", row.label), LAND_X, y, RED, 0.9);
+    } else {
+        line("\u{2191}\u{2193} choose   Enter open   Del delete   Esc new", LAND_X, y, FG, 0.4);
+    }
+    line("in a session, Ctrl+Shift+S saves it under a name", LAND_X, y + lh, FG, 0.25);
 }
 
 /// The view button, and in Tabs view the strip with a tab per pane, over the panes.
@@ -1254,8 +1635,12 @@ unsafe fn end_rename(hwnd: HWND, keep: bool) {
 
 /// Change the font size by a step (see `zoomed`); every terminal refits.
 unsafe fn zoom(hwnd: HWND, step: i32) {
+    let size = with(|a| zoomed(a.font_size, step));
+    set_font(hwnd, size);
+}
+
+unsafe fn set_font(hwnd: HWND, size: f32) {
     let changed = with(|a| {
-        let size = zoomed(a.font_size, step);
         if size == a.font_size {
             return false;
         }
@@ -1271,6 +1656,107 @@ unsafe fn zoom(hwnd: HWND, step: i32) {
     if changed {
         layout(hwnd);
     }
+}
+
+/// Write the current session to `file`. False when there is nothing to save or writing failed.
+fn save_session(file: &std::path::Path) -> bool {
+    let Some(s) = with(|a| a.session()) else { return false };
+    file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::write(file, session_text(&s)).is_ok()
+}
+
+/// Closing the window remembers the session for the landing page's "Last session".
+fn save_last() {
+    if let Some(dir) = data_dir() {
+        save_session(&dir.join("last.session"));
+    }
+}
+
+/// Open a saved session in the empty window: its panes start in their folders.
+unsafe fn open_session(hwnd: HWND, s: Session) -> bool {
+    set_font(hwnd, s.font);
+    let scale = scale(hwnd);
+    let opened = with(|a| {
+        let mut panes = Vec::new();
+        for (id, (cwd, name)) in s.panes.iter().enumerate() {
+            let dir = Some(cwd.as_str()).filter(|c| !c.is_empty());
+            let Ok(mut p) = spawn(hwnd, id, &a.bash, a.cell, scale, dir) else {
+                panes.iter().for_each(|p: &Pane| drop(p.tx.send(Msg::Shutdown)));
+                return false;
+            };
+            p.custom = (!name.is_empty()).then(|| name.clone());
+            panes.push(p);
+        }
+        // Leaves are 0.. in tree order, the same as the ids just given out.
+        (a.panes, a.tree, a.next_id, a.view, a.focus) = (panes, Some(s.tree), s.panes.len(), s.view, s.focus);
+        a.created = if s.created > 0 { s.created } else { now() };
+        true
+    });
+    if opened {
+        layout(hwnd);
+    }
+    opened
+}
+
+/// Leave the landing page through choice `i`: a saved session, or a new one (also when the file
+/// can't be opened any more).
+unsafe fn open_choice(hwnd: HWND, i: usize) {
+    let session = with(|a| {
+        a.created = now(); // a new session starts now; a restored one takes its own time
+        a.landing.take().and_then(|l| l.rows.into_iter().nth(i)).and_then(|c| c.session)
+    });
+    if !session.is_some_and(|s| open_session(hwnd, s)) {
+        add_pane(hwnd, None);
+    }
+    if with(|a| a.panes.is_empty()) {
+        fail("Could not start Git Bash");
+        let _ = DestroyWindow(hwnd);
+    }
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// Keys on the landing page: ↑↓ choose, Enter opens, Esc starts a new session, Del (twice) deletes a saved one.
+unsafe fn landing_key(hwnd: HWND, vk: u16) {
+    match vk {
+        0x26 | 0x28 => with(|a| {
+            if let Some(l) = a.landing.as_mut() {
+                l.sel = cycle(l.rows.len(), l.sel, if vk == 0x26 { -1 } else { 1 });
+                l.armed = false;
+            }
+        }),
+        0x0D | 0x1B => {
+            with(|a| a.skip_char = true); // the Enter / Esc character is not for the new shell
+            let i = with(|a| if vk == 0x0D { a.landing.as_ref().map_or(0, |l| l.sel) } else { 0 });
+            open_choice(hwnd, i);
+        }
+        0x2E => with(|a| {
+            let Some(l) = a.landing.as_mut() else { return };
+            if !l.rows[l.sel].saved {
+                return;
+            }
+            if !std::mem::replace(&mut l.armed, true) {
+                return; // the first press only asks
+            }
+            if let Some(f) = &l.rows[l.sel].file {
+                let _ = std::fs::remove_file(f);
+            }
+            l.rows.remove(l.sel);
+            l.sel = l.sel.min(l.rows.len() - 1);
+            l.armed = false;
+        }),
+        _ => {}
+    }
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// Enter in the Ctrl+Shift+S prompt: save under the typed name and say so for a moment.
+unsafe fn end_prompt(hwnd: HWND, keep: bool) {
+    let typed = with(|a| a.prompt.take());
+    if let (true, Some(name)) = (keep, typed.as_deref().and_then(session_file_name)) {
+        let saved = data_dir().is_some_and(|d| save_session(&d.join("sessions").join(format!("{name}.session"))));
+        with(|a| a.toast = Some(if saved { format!("saved \u{201c}{name}\u{201d}") } else { "could not save".into() }));
+        SetTimer(Some(hwnd), TOAST_TIMER, 1500, None);
+    }
+    let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
 /// Ctrl+Shift+Z / Ctrl+Shift+G / the view button: switch to `to` or back to the grid (see `toggled`).
@@ -1323,6 +1809,44 @@ unsafe fn modifiers() -> (bool, bool, bool) {
 /// Returns true when the key was handled here.
 unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
     let (shift, alt, ctrl) = modifiers();
+    // The landing page takes every key; Alt chords (Alt+F4) stay with the system.
+    if with(|a| a.landing.is_some()) {
+        if !alt {
+            landing_key(hwnd, vk);
+        }
+        return !alt;
+    }
+    // Typing a session name (Ctrl+Shift+S): like renaming, keys edit it.
+    if with(|a| a.prompt.is_some()) {
+        if !alt {
+            match vk {
+                0x0D | 0x1B => {
+                    with(|a| a.skip_char = true);
+                    end_prompt(hwnd, vk == 0x0D);
+                }
+                0x08 => {
+                    with(|a| {
+                        if let Some(t) = a.prompt.as_mut() {
+                            t.pop();
+                        }
+                    });
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                _ => {}
+            }
+        }
+        return !alt;
+    }
+    // Ctrl+Shift+S: save the session under a name typed at the bottom of the window.
+    if ctrl && shift && !alt && vk == 'S' as u16 && with(|a| a.rename.is_none()) {
+        drop_char(hwnd);
+        with(|a| {
+            a.prompt = Some(String::new());
+            a.toast = None;
+        });
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        return true;
+    }
     // While a name is typed, keys edit it and never reach the shell; Alt chords stay with the system.
     if with(|a| a.rename.is_some()) {
         if !alt {
@@ -1504,6 +2028,15 @@ unsafe fn on_char(unit: u16, alt: bool) {
         }
         let units = if (0xDC00..0xE000).contains(&unit) { vec![std::mem::take(&mut a.surrogate), unit] } else { vec![unit] };
         let mut s: String = char::decode_utf16(units).filter_map(|r| r.ok()).collect();
+        if a.landing.is_some() {
+            return;
+        }
+        if let Some(typed) = a.prompt.as_mut() {
+            if !alt && !s.chars().any(char::is_control) && typed.chars().count() < PROMPT_MAX {
+                typed.push_str(&s);
+            }
+            return;
+        }
         // While a name is typed, text goes there; control keys are handled in on_key.
         if let Some((_, typed)) = a.rename.as_mut() {
             if !alt && !s.chars().any(char::is_control) && typed.chars().count() < NAME_MAX {
@@ -1579,7 +2112,37 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         WM_ERASEBKGND => return LRESULT(1),
+        // Always draw the frame as active: Windows otherwise swaps the acrylic for a flat color
+        // whenever another window has the focus.
+        WM_NCACTIVATE => return DefWindowProcW(hwnd, msg, WPARAM(1), lp),
         WM_SIZE => layout(hwnd),
+        // Closing the window (not the last pane exiting) remembers the session.
+        WM_CLOSE => save_last(),
+        WM_ENDSESSION if wp.0 != 0 => save_last(),
+        WM_TIMER if wp.0 == TOAST_TIMER => {
+            let _ = KillTimer(Some(hwnd), TOAST_TIMER);
+            with(|a| a.toast = None);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            return LRESULT(0);
+        }
+        // The landing page: hovering selects a choice, a click opens it.
+        WM_MOUSEMOVE | WM_LBUTTONDOWN if with(|a| a.landing.is_some()) => {
+            let m = mouse(hwnd);
+            let row = with(|a| landing_row(m.1, land_line(a.cell.1), a.landing.as_ref().map_or(0, |l| l.rows.len())));
+            if let Some(i) = row {
+                if msg == WM_LBUTTONDOWN {
+                    open_choice(hwnd, i);
+                } else if with(|a| a.landing.as_mut().is_some_and(|l| std::mem::replace(&mut l.sel, i) != i)) {
+                    with(|a| a.landing.as_mut().map(|l| l.armed = false));
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT && with(|a| a.landing.is_some()) => {
+            let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
+            return LRESULT(1);
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             if on_key(hwnd, wp.0 as u16) {
                 return LRESULT(0);
@@ -1796,7 +2359,8 @@ fn main() {
                 focus: 0, next_id: 0, tree: None, drag: None, surrogate: 0, skip_char: false,
                 select: None, click: (0, f32::MIN, f32::MIN, 0),
                 home: std::env::var("USERPROFILE").ok(), rename: None, title: "dterm".into(),
-                view: View::Grid, mouse: None, tracking: false,
+                view: View::Grid, mouse: None, tracking: false, landing: None, prompt: None, toast: None,
+                created: now(),
             })
         });
         let hwnd = CreateWindowExW(
@@ -1813,9 +2377,15 @@ fn main() {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as _, 4);
         let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
 
-        add_pane(hwnd, None);
-        if with(|a| a.panes.is_empty()) {
-            return fail("Could not start Git Bash");
+        // With a last or saved session, start on the landing page; otherwise straight in a new one.
+        let rows = data_dir().map(|d| landing_rows(&d, &ago)).unwrap_or_default();
+        if rows.len() > 1 {
+            with(|a| a.landing = Some(Landing { rows, sel: 0, armed: false }));
+        } else {
+            add_pane(hwnd, None);
+            if with(|a| a.panes.is_empty()) {
+                return fail("Could not start Git Bash");
+            }
         }
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT); // honors a shortcut's "Run: Maximized"
         let mut msg = MSG::default();
@@ -2021,4 +2591,64 @@ fn check() {
     assert_eq!(wheel_input(TermMode::ALTERNATE_SCROLL, 120, (0, 0)), None);
     assert_eq!(wheel_input(TermMode::NONE, 120, (0, 0)), None);
     assert_eq!(clip_units("a\nb"), [97, 13, 10, 98, 0]);
+    // Sessions: pane 0 | (pane 1 over pane 2), round trip through the file format.
+    let tree = Node::Split {
+        side_by_side: true,
+        ratio: 0.25,
+        a: Box::new(Node::Leaf(0)),
+        b: Box::new(Node::Split { side_by_side: false, ratio: 0.5, a: Box::new(Node::Leaf(1)), b: Box::new(Node::Leaf(2)) }),
+    };
+    let panes = vec![("C:\\a b".into(), "build".into()), (String::new(), String::new()), ("D:\\x".into(), String::new())];
+    let s = Session { view: View::Tabs, font: 18.0, focus: 2, tree, panes, created: 1_700_000_000, closed: 1_700_003_600 };
+    let text = session_text(&s);
+    assert!(text.starts_with(
+        "dterm-session 1\nview tabs\nfont 18\nfocus 2\ncreated 1700000000\nclosed 1700003600\nsplit side 0.250\npane C:\\a b\tbuild\n"
+    ));
+    assert_eq!(parse_session(&text), Some(s));
+    assert!(parse_session(&text.replace("\n", "\r\n")).is_some()); // Notepad line breaks
+    // Leaves get renumbered in tree order, whatever their ids were.
+    let odd = Node::Split { side_by_side: true, ratio: 0.5, a: Box::new(Node::Leaf(7)), b: Box::new(Node::Leaf(3)) };
+    assert_eq!(odd.numbered(&mut 0).ids(), vec![0, 1]);
+    // Anything malformed is refused, never a panic.
+    let head = "dterm-session 1\nview grid\nfont 16\nfocus 0\n";
+    for bad in ["", "dterm-session 2\n", head, &format!("{head}split side 0.5\npane a\t\n"), &format!("{head}split up 0.5\n"),
+        &format!("{head}split side x\npane a\t\npane b\t\n"), &format!("{head}pane a\t\npane b\t\n"), "view grid\nfont 16\n"] {
+        assert!(parse_session(bad).is_none(), "{bad:?}");
+    }
+    let one = parse_session(&format!("{head}pane \t\n")).unwrap();
+    assert_eq!((one.tree, one.panes), (Node::Leaf(0), vec![(String::new(), String::new())]));
+    assert_eq!(parse_session("dterm-session 1\nview grid\nfont 99\nfocus 9\npane a\t\n").map(|s| (s.font, s.focus)), Some((40.0, 0)));
+    // Saved-session file names keep letters, digits, space, - and _.
+    assert_eq!(session_file_name("  my: work/agents?  "), Some("my workagents".into()));
+    assert_eq!(session_file_name("../.."), None);
+    assert_eq!(session_file_name("a_b-c 2"), Some("a_b-c 2".into()));
+    // Landing page rows: choices start two lines below LAND_Y.
+    assert_eq!(landing_row(LAND_ROWS + 1.0, 20.0, 3), Some(0));
+    assert_eq!(landing_row(LAND_ROWS + 2.0 * 20.0 + 1.0, 20.0, 3), Some(2));
+    assert_eq!(landing_row(LAND_ROWS + 3.0 * 20.0 + 1.0, 20.0, 3), None);
+    assert_eq!(landing_row(LAND_ROWS - 1.0, 20.0, 3), None);
+    // Files from before the timestamps still open, with unknown times.
+    let old = parse_session("dterm-session 1\nview grid\nfont 16\nfocus 0\npane C:\\x\t\n").unwrap();
+    assert_eq!((old.created, old.closed), (0, 0));
+    assert!(parse_session("\u{feff}dterm-session 1\nview grid\nfont 16\nfocus 0\npane a\t\n").is_some()); // BOM
+    // Times in words.
+    let (today, yesterday) = ((2026, 10, 16), (2026, 10, 15));
+    assert_eq!(when((2026, 10, 16, 9, 5), today, yesterday), "today 09:05");
+    assert_eq!(when((2026, 10, 15, 23, 59), today, yesterday), "yesterday 23:59");
+    assert_eq!(when((2026, 3, 1, 14, 2), today, yesterday), "1 Mar 14:02");
+    assert_eq!(when((2025, 12, 31, 14, 2), today, yesterday), "31 Dec 2025");
+    assert_eq!(ago(0), "");
+    // Preview names: the typed name, else the folder, "~" for home or unknown.
+    let home = Some("C:\\Users\\x");
+    assert_eq!(preview_name(&("C:\\Users\\x\\dterm".into(), String::new()), home), "dterm");
+    assert_eq!(preview_name(&("C:\\Users\\X\\".into(), String::new()), home), "~");
+    assert_eq!(preview_name(&(String::new(), String::new()), home), "~");
+    assert_eq!(preview_name(&("C:\\a".into(), "build".into()), home), "build");
+    // The console's first title (the shell's path) is not an app name.
+    let mut n = Names::default();
+    n.set_title(Some("C:\\Program Files\\Git\\bin\\bash.exe"));
+    assert_eq!(n.app, None);
+    n.set_title(Some("Claude Code"));
+    assert_eq!(n.app.as_deref(), Some("Claude Code"));
+    assert_eq!(pane_count(1), "1 pane");
 }
