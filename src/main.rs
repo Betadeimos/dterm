@@ -1,7 +1,8 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 //! dterm: Git Bash panes in a resizable grid, drawn with Direct2D/DirectWrite on an acrylic window.
 //! Terminal emulation and ConPTY come from alacritty_terminal.
-//! Ctrl+Shift+T adds a pane, Ctrl+V pastes plain text, drag the gaps to resize, `exit` closes a pane.
+//! Ctrl+Shift+T adds a pane, Alt+arrows move the focus, Ctrl+V pastes plain text,
+//! drag the gaps to resize, `exit` closes a pane.
 
 use std::{
     borrow::Cow,
@@ -175,6 +176,29 @@ fn hit(f: &[f32], x: f32, len: f32) -> Option<usize> {
 
 fn drag_to(f: &mut [f32], i: usize, x: f32, len: f32) {
     f[i] = (x / len.max(1.0)).max(f[i - 1] + MIN).min(f[i + 1] - MIN);
+}
+
+/// Pane next to `from` in direction `(dx, dy)`: the nearest one past its edge, preferring panes
+/// straight in line with it.
+fn neighbor(rects: &[(f32, f32, f32, f32)], from: usize, (dx, dy): (i32, i32)) -> Option<usize> {
+    let (fx, fy, fw, fh) = *rects.get(from)?;
+    let (fcx, fcy) = (fx + fw / 2.0, fy + fh / 2.0);
+    rects
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != from)
+        .filter_map(|(i, &(x, y, w, h))| {
+            let ahead = match (dx, dy) {
+                (1, _) => x - (fx + fw),
+                (-1, _) => fx - (x + w),
+                (_, 1) => y - (fy + fh),
+                _ => fy - (y + h),
+            };
+            let side = if dx != 0 { (y + h / 2.0 - fcy).abs() } else { (x + w / 2.0 - fcx).abs() };
+            (ahead >= -1.0).then_some((i, ahead + side))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
 }
 
 /// Terminal columns and lines that fit in a pane of `w` x `h` DIPs.
@@ -575,6 +599,24 @@ unsafe fn modifiers() -> (bool, bool, bool) {
 /// Returns true when the key was handled here.
 unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
     let (shift, alt, ctrl) = modifiers();
+    // Alt+arrows move the focus between panes, like Windows Terminal.
+    let dir = match vk {
+        0x25 => Some((-1, 0)),
+        0x27 => Some((1, 0)),
+        0x26 => Some((0, -1)),
+        0x28 => Some((0, 1)),
+        _ => None,
+    };
+    if let (Some(d), true, false, false) = (dir, alt, ctrl, shift) {
+        with(|a| {
+            let rects: Vec<_> = a.panes.iter().map(|p| p.rect).collect();
+            if let Some(i) = neighbor(&rects, a.focus, d) {
+                a.focus = i;
+            }
+        });
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        return true;
+    }
     // dterm shortcuts; their Ctrl+letter WM_CHAR must not reach the shell.
     if ctrl && !alt && (vk == 'V' as u16 || (shift && vk == 'T' as u16)) {
         with(|a| a.skip_char = true);
@@ -827,4 +869,19 @@ fn check() {
     assert_eq!(hit(&f, 200.0, 1000.0), None);
     drag_to(&mut f, 1, 990.0, 1000.0);
     assert!((f[1] - 0.95).abs() < 1e-6);
+    // 3 panes: top-left, top-right, bottom spanning both.
+    let r = [(0.0, 0.0, 497.0, 297.0), (503.0, 0.0, 497.0, 297.0), (0.0, 303.0, 1000.0, 297.0)];
+    assert_eq!(neighbor(&r, 0, (1, 0)), Some(1));
+    assert_eq!(neighbor(&r, 1, (-1, 0)), Some(0));
+    assert_eq!(neighbor(&r, 0, (0, 1)), Some(2));
+    assert_eq!(neighbor(&r, 1, (0, 1)), Some(2));
+    assert_eq!(neighbor(&r, 2, (0, -1)), Some(0));
+    assert_eq!(neighbor(&r, 1, (1, 0)), None);
+    assert_eq!(neighbor(&r, 2, (0, 1)), None);
+    // 2x3 grid: moving right from the top-left stays in the top row.
+    let g = [(0.0, 0.0, 330.0, 297.0), (336.0, 0.0, 330.0, 297.0), (672.0, 0.0, 328.0, 297.0),
+             (0.0, 303.0, 330.0, 297.0), (336.0, 303.0, 330.0, 297.0)];
+    assert_eq!(neighbor(&g, 0, (1, 0)), Some(1));
+    assert_eq!(neighbor(&g, 4, (0, -1)), Some(1));
+    assert_eq!(neighbor(&[], 0, (1, 0)), None);
 }
