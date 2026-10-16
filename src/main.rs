@@ -1,26 +1,29 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 //! dterm: Git Bash panes in a tree of splits, drawn with Direct2D/DirectWrite on an acrylic window.
 //! Terminal emulation and ConPTY come from alacritty_terminal.
-//! Ctrl+Shift+T splits the largest pane, Alt+Shift+Plus / Alt+Shift+Minus split the focused one
-//! side by side / top and bottom, Ctrl+Shift+W (or `exit`) closes a pane. Alt+arrows move the focus,
-//! Alt+Shift+arrows resize, Ctrl+Alt+arrows swap panes, drag the gaps to resize.
-//! Ctrl+V pastes plain text. Select with the mouse or Shift+arrows,
-//! copy with Ctrl+C (or right-click), the wheel scrolls back.
-//! With several panes each shows a name (typed, else the app's title, else its folder);
-//! Ctrl+Shift+R renames the focused one (Enter confirms, Esc cancels, empty resets).
-//! Ctrl+Plus / Ctrl+Minus / Ctrl+wheel resize the font, Ctrl+0 resets it.
-//! Ctrl+Shift+Z zooms the focused pane to the whole window (again to go back); the other panes keep
-//! running. Ctrl+Tab / Ctrl+Shift+Tab move the focus to the next / previous pane.
-//! Ctrl+Shift+G (or the button in the top-right corner, shown when the mouse is near the top edge)
-//! shows the panes as tabs in a strip instead; click a tab, press Ctrl+Tab or Alt+Left/Right to switch,
-//! and use the button at the right end of the strip (or Ctrl+Shift+G) to get the grid back.
-//! Closing the window remembers the session (layout, folders, names, view, font); Ctrl+Shift+S saves
-//! it under a name. With anything saved, dterm starts on a landing page to pick one or a new session.
+//! Shortcuts (the defaults; the settings page changes them): Ctrl+Alt+T splits the largest pane,
+//! Ctrl+Alt+Plus / Ctrl+Alt+Minus (or Alt+Shift+Plus / Minus, as in Windows Terminal) split the
+//! focused one side by side / top and bottom, Ctrl+Alt+W (or `exit`) closes a pane, Ctrl+Alt+R
+//! renames it (Enter confirms, Esc cancels, empty resets), Ctrl+Alt+Z zooms it to the whole window,
+//! Ctrl+Alt+G shows the panes as tabs (also the button in the top-right corner, shown when the mouse
+//! is near the top edge), Ctrl+Alt+S saves the session under a name, Ctrl+Alt+H goes to the start
+//! page (the ≡ button) and Ctrl+Alt+Comma opens the settings (theme, opacity, shortcuts).
+//! AltGr+key still types its character where the keyboard layout has one.
+//! Fixed keys: Alt+arrows move the focus, Alt+Shift+arrows resize, Ctrl+Alt+arrows swap panes, drag
+//! the gaps to resize, Ctrl+Tab / Ctrl+Shift+Tab go to the next / previous pane. Select with the
+//! mouse or Shift+arrows (Ctrl+Shift+Left / Right by word), copy with Ctrl+C (or right-click),
+//! Ctrl+V pastes plain text, the wheel scrolls back, Ctrl+Plus / Minus / 0 / wheel set the font size.
+//! Closing the window remembers the session (layout, folders, names, view, font, and the Claude Code
+//! conversation of each pane that runs one); with anything saved, dterm starts on a landing page
+//! to pick a session or a new one.
 
 use std::{
     borrow::Cow,
     cell::RefCell,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    },
 };
 
 use alacritty_terminal::{
@@ -47,10 +50,12 @@ use windows::{
         },
         System::{
             DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData},
+            Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS},
             LibraryLoader::GetModuleHandleW,
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
             Ole::CF_UNICODETEXT,
             Registry::*,
+            Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
             Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
         },
         UI::{Controls::{MARGINS, WM_MOUSELEAVE}, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
@@ -67,15 +72,80 @@ const MSYSTEMS: [&str; 6] = ["MINGW64", "MINGW32", "MSYS", "UCRT64", "CLANG64", 
 const GAP: f32 = 6.0; // DIPs between panes
 const MIN: f32 = 0.05; // smallest child of a split, as a fraction of it
 const STEP: f32 = 40.0; // DIPs a divider moves per Alt+Shift+arrow
-const OPACITY: f32 = 0.7; // pane background over the acrylic, like your Windows Terminal profile
+const OPACITY: f32 = 0.7; // default pane background over the acrylic, like your Windows Terminal profile
 const WM_WAKE: u32 = WM_APP; // new terminal output
 const WM_EXIT: u32 = WM_APP + 1; // a shell exited; wparam = pane id
 const SLOP: f32 = 4.0; // DIPs the mouse may move between the clicks of a double-click
 
-// One Half Dark, as in Windows Terminal. ANSI order: black red green yellow blue magenta cyan white.
-const FG: u32 = 0xDCDFE4;
-const BG: u32 = 0x282C34;
-const GAP_COLOR: u32 = 0x1B1D23;
+/// A color scheme. ANSI order: black red green yellow blue magenta cyan white, then the bright ones.
+struct Theme {
+    name: &'static str,
+    fg: u32,
+    bg: u32,
+    gap: u32, // between panes
+    ansi: [u32; 16],
+}
+
+/// The first is the default: One Half Dark, as in Windows Terminal. The others are Windows
+/// Terminal's Campbell and the Catppuccin Mocha and Dracula schemes.
+const THEMES: [Theme; 4] = [
+    Theme {
+        name: "One Half Dark",
+        fg: 0xDCDFE4,
+        bg: 0x282C34,
+        gap: 0x1B1D23,
+        ansi: [
+            0x282C34, 0xE06C75, 0x98C379, 0xE5C07B, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xDCDFE4,
+            0x5A6374, 0xE06C75, 0x98C379, 0xE5C07B, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xDCDFE4,
+        ],
+    },
+    Theme {
+        name: "Campbell",
+        fg: 0xCCCCCC,
+        bg: 0x0C0C0C,
+        gap: 0x000000,
+        ansi: [
+            0x0C0C0C, 0xC50F1F, 0x13A10E, 0xC19C00, 0x0037DA, 0x881798, 0x3A96DD, 0xCCCCCC,
+            0x767676, 0xE74856, 0x16C60C, 0xF9F1A5, 0x3B78FF, 0xB4009E, 0x61D6D6, 0xF2F2F2,
+        ],
+    },
+    Theme {
+        name: "Catppuccin Mocha",
+        fg: 0xCDD6F4,
+        bg: 0x1E1E2E,
+        gap: 0x11111B,
+        ansi: [
+            0x45475A, 0xF38BA8, 0xA6E3A1, 0xF9E2AF, 0x89B4FA, 0xF5C2E7, 0x94E2D5, 0xBAC2DE,
+            0x585B70, 0xF38BA8, 0xA6E3A1, 0xF9E2AF, 0x89B4FA, 0xF5C2E7, 0x94E2D5, 0xA6ADC8,
+        ],
+    },
+    Theme {
+        name: "Dracula",
+        fg: 0xF8F8F2,
+        bg: 0x282A36,
+        gap: 0x191A21,
+        ansi: [
+            0x21222C, 0xFF5555, 0x50FA7B, 0xF1FA8C, 0xBD93F9, 0xFF79C6, 0x8BE9FD, 0xF8F8F2,
+            0x6272A4, 0xFF6E6E, 0x69FF94, 0xFFFFA5, 0xD6ACFF, 0xFF92DF, 0xA4FFFF, 0xFFFFFF,
+        ],
+    },
+];
+
+/// Index into THEMES of the theme in use; a global so that color lookups need no App.
+static THEME: AtomicUsize = AtomicUsize::new(0);
+
+fn theme() -> &'static Theme {
+    &THEMES[THEME.load(Ordering::Relaxed).min(THEMES.len() - 1)]
+}
+
+fn fg() -> Rgb {
+    rgb(theme().fg)
+}
+
+fn bg() -> Rgb {
+    rgb(theme().bg)
+}
+
 const SELECTION_ALPHA: f32 = 0.25; // foreground veil over selected cells
 const FOCUS_ALPHA: f32 = 0.15; // foreground border of the focused pane
 const VEIL_ALPHA: f32 = 0.25; // background veil over unfocused panes
@@ -95,12 +165,6 @@ const LOGO_SIZE: f32 = 44.0; // DIPs
 const PREVIEW: (f32, f32) = (320.0, 200.0); // DIPs, the selected session's layout
 const PROMPT_MAX: usize = 40; // characters of a typed session name
 const TOAST_TIMER: usize = 1; // hides the "saved" note
-const GREEN: u32 = 0x98C379; // One Half Dark green, as in the icon
-const RED: u32 = 0xE06C75;
-const PALETTE: [u32; 16] = [
-    0x282C34, 0xE06C75, 0x98C379, 0xE5C07B, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xDCDFE4,
-    0x5A6374, 0xE06C75, 0x98C379, 0xE5C07B, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xDCDFE4,
-];
 
 fn rgb(c: u32) -> Rgb {
     Rgb { r: (c >> 16) as u8, g: (c >> 8) as u8, b: c as u8 }
@@ -113,7 +177,7 @@ fn dim(c: Rgb) -> Rgb {
 /// xterm 256-color table.
 fn indexed(i: u8) -> Rgb {
     match i {
-        0..=15 => rgb(PALETTE[i as usize]),
+        0..=15 => rgb(theme().ansi[i as usize]),
         16..=231 => {
             let i = i - 16;
             let v = |x: u8| if x == 0 { 0 } else { 55 + x * 40 };
@@ -141,8 +205,8 @@ fn resolve(c: Color, bold: bool, colors: &Colors) -> Option<Rgb> {
         0..=255 => Some(indexed(i as u8)),
         257 => None,                                      // background
         259..=266 => Some(dim(indexed((i - 259) as u8))), // dim colors
-        268 => Some(dim(rgb(FG))),                        // dim foreground
-        _ => Some(rgb(FG)),                               // foreground, cursor, bright foreground
+        268 => Some(dim(fg())),                        // dim foreground
+        _ => Some(fg()),                               // foreground, cursor, bright foreground
     }
 }
 
@@ -466,10 +530,11 @@ fn tab_width(n: usize, room: f32) -> f32 {
 enum Hit {
     Tab(usize),
     Button, // switches between the grid and the tabs
+    Home,   // goes to the start page
 }
 
-/// What `m` is over: a tab (in Tabs view) or the view button, the `TAB_H` square in the top-right
-/// corner of a `width` DIPs wide window.
+/// What `m` is over: a tab (in Tabs view), the view button (the `TAB_H` square in the top-right
+/// corner of a `width` DIPs wide window) or the start-page button left of it.
 fn chrome_hit(view: View, tabs: usize, (x, y): (f32, f32), width: f32) -> Option<Hit> {
     if !(0.0..TAB_H).contains(&y) {
         return None;
@@ -477,7 +542,10 @@ fn chrome_hit(view: View, tabs: usize, (x, y): (f32, f32), width: f32) -> Option
     if (width - TAB_H..width).contains(&x) {
         return Some(Hit::Button);
     }
-    let tw = tab_width(tabs, width - TAB_H);
+    if (width - 2.0 * TAB_H..width - TAB_H).contains(&x) {
+        return Some(Hit::Home);
+    }
+    let tw = tab_width(tabs, width - 2.0 * TAB_H);
     (view == View::Tabs && tw > 0.0 && (0.0..tw * tabs as f32).contains(&x)).then(|| Hit::Tab((x / tw) as usize))
 }
 
@@ -497,18 +565,180 @@ fn zoomed(size: f32, step: i32) -> f32 {
     if step == 0 { FONT_SIZE } else { (size + step as f32).clamp(8.0, 40.0) }
 }
 
-/// A saved session: the split tree (its leaves index `panes`, in tree order), each pane's folder
-/// and typed name (either may be empty), the view, the font size, the focused pane's index, and
-/// when the session was started and last saved (Unix seconds, 0 = unknown).
+/// dterm commands that have a shortcut you can change on the settings page.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Action {
+    NewPane,
+    SplitRight,
+    SplitDown,
+    Close,
+    Rename,
+    Save,
+    Zoom,
+    Tabs,
+    Home,
+    Settings,
+}
+
+/// Each action's id in the settings file, its name on the settings page, and its default keys.
+/// The settings page lists them in this order.
+const ACTIONS: [(Action, &str, &str, &str); 10] = [
+    (Action::NewPane, "new-pane", "New pane", "Ctrl+Alt+T"),
+    (Action::SplitRight, "split-right", "Split right", "Ctrl+Alt+Plus"),
+    (Action::SplitDown, "split-down", "Split below", "Ctrl+Alt+Minus"),
+    (Action::Close, "close-pane", "Close pane", "Ctrl+Alt+W"),
+    (Action::Rename, "rename-pane", "Rename pane", "Ctrl+Alt+R"),
+    (Action::Save, "save-session", "Save session", "Ctrl+Alt+S"),
+    (Action::Zoom, "zoom", "Zoom pane", "Ctrl+Alt+Z"),
+    (Action::Tabs, "grid-tabs", "Grid / tabs", "Ctrl+Alt+G"),
+    (Action::Home, "start-page", "Start page", "Ctrl+Alt+H"),
+    (Action::Settings, "settings", "Settings", "Ctrl+Alt+Comma"),
+];
+
+/// A key with modifiers.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Chord {
+    vk: u16,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+}
+
+/// The chord for a key event. The keypad's + and - count as the main ones.
+fn chord_of(vk: u16, shift: bool, alt: bool, ctrl: bool) -> Chord {
+    let vk = match vk {
+        0x6B => 0xBB, // VK_ADD -> VK_OEM_PLUS
+        0x6D => 0xBD, // VK_SUBTRACT -> VK_OEM_MINUS
+        v => v,
+    };
+    Chord { vk, ctrl, alt, shift }
+}
+
+/// Keys a shortcut can use besides letters, digits and F1-F12. Arrows and Tab are taken by the
+/// fixed shortcuts.
+const KEY_NAMES: [(u16, &str); 11] = [
+    (0xBB, "Plus"), (0xBD, "Minus"), (0xBC, "Comma"), (0xBE, "Period"), (0x24, "Home"), (0x23, "End"),
+    (0x21, "PageUp"), (0x22, "PageDown"), (0x2D, "Insert"), (0x2E, "Delete"), (0x20, "Space"),
+];
+
+fn key_name(vk: u16) -> Option<String> {
+    match vk {
+        0x30..=0x39 | 0x41..=0x5A => Some((vk as u8 as char).to_string()),
+        0x70..=0x7B => Some(format!("F{}", vk - 0x6F)),
+        _ => KEY_NAMES.iter().find(|k| k.0 == vk).map(|k| k.1.into()),
+    }
+}
+
+/// "Ctrl+Alt+T".
+fn chord_text(c: Chord) -> String {
+    let mods = [(c.ctrl, "Ctrl+"), (c.alt, "Alt+"), (c.shift, "Shift+")];
+    let mut s: String = mods.iter().filter(|m| m.0).map(|m| m.1).collect();
+    s.push_str(&key_name(c.vk).unwrap_or_default());
+    s
+}
+
+/// The chord in `chord_text` form. A shortcut needs Ctrl or Alt, so that it never takes typing.
+fn parse_chord(text: &str) -> Option<Chord> {
+    let (mods, key) = text.trim().rsplit_once('+').unwrap_or(("", text.trim()));
+    let vk = (0..=0xFFu16).find(|&v| key_name(v).is_some_and(|n| n.eq_ignore_ascii_case(key)))?;
+    let mut c = Chord { vk, ctrl: false, alt: false, shift: false };
+    for m in mods.split('+') {
+        match m.to_ascii_lowercase().as_str() {
+            "ctrl" => c.ctrl = true,
+            "alt" => c.alt = true,
+            "shift" => c.shift = true,
+            _ => return None,
+        }
+    }
+    (c.ctrl || c.alt).then_some(c)
+}
+
+const MIN_OPACITY: f32 = 0.2;
+
+/// What the settings page changes: the theme (index into THEMES), the pane opacity, and each
+/// action's keys (`None` = no shortcut), in ACTIONS order.
+#[derive(Clone, PartialEq, Debug)]
+struct Settings {
+    theme: usize,
+    opacity: f32,
+    keys: [Option<Chord>; ACTIONS.len()],
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { theme: 0, opacity: OPACITY, keys: ACTIONS.map(|a| parse_chord(a.3)) }
+    }
+}
+
+impl Settings {
+    fn action(&self, c: Chord) -> Option<Action> {
+        self.keys.iter().position(|k| *k == Some(c)).map(|i| ACTIONS[i].0)
+    }
+
+    /// Give action `i` the keys `c`, taking them away from any other action that had them.
+    fn bind(&mut self, i: usize, c: Option<Chord>) {
+        for k in self.keys.iter_mut().filter(|k| c.is_some() && **k == c) {
+            *k = None;
+        }
+        self.keys[i] = c;
+    }
+}
+
+/// Settings file text: `theme <name>`, `opacity <percent>`, then `key <action id> <keys or none>`.
+fn settings_text(s: &Settings) -> String {
+    let mut out = format!("dterm-settings 1\ntheme {}\nopacity {}\n", THEMES[s.theme].name, (s.opacity * 100.0).round());
+    for (a, k) in ACTIONS.iter().zip(s.keys) {
+        out.push_str(&format!("key {} {}\n", a.1, k.map_or("none".into(), chord_text)));
+    }
+    out
+}
+
+/// Settings in `settings_text` form. Lines that are missing or unreadable keep the default,
+/// except keys that can't be read, which end up with no shortcut.
+fn parse_settings(text: &str) -> Settings {
+    let mut s = Settings::default();
+    for line in text.lines().map(|l| l.trim().trim_start_matches('\u{feff}')) {
+        if let Some(name) = line.strip_prefix("theme ") {
+            s.theme = THEMES.iter().position(|t| t.name.eq_ignore_ascii_case(name.trim())).unwrap_or(s.theme);
+        } else if let Some(v) = line.strip_prefix("opacity ") {
+            s.opacity = v.trim().parse::<f32>().map_or(s.opacity, |v| (v / 100.0).clamp(MIN_OPACITY, 1.0));
+        } else if let Some((id, keys)) = line.strip_prefix("key ").and_then(|r| r.split_once(' ')) {
+            if let Some(i) = ACTIONS.iter().position(|a| a.1 == id) {
+                s.keys[i] = parse_chord(keys);
+            }
+        }
+    }
+    s
+}
+
+/// A pane in a saved session: its folder, its typed name, and the command that brings back the
+/// program it was running (see `resume_command`). Any of them may be empty.
+#[derive(Debug, PartialEq, Default, Clone)]
+struct SavedPane {
+    cwd: String,
+    name: String,
+    run: String,
+}
+
+/// A saved session: the split tree (its leaves index `panes`, in tree order), the panes, the
+/// view, the font size, the focused pane's index, and when the session was started and last
+/// saved (Unix seconds, 0 = unknown).
 #[derive(Debug, PartialEq)]
 struct Session {
     view: View,
     font: f32,
     focus: usize,
     tree: Node,
-    panes: Vec<(String, String)>,
+    panes: Vec<SavedPane>,
     created: u64,
     closed: u64,
+}
+
+/// Whether `run` is a command dterm itself would save: `claude` alone, or resuming one Claude Code
+/// conversation by its id. Session files are plain text, so nothing else is ever run from them.
+fn resume_command(run: &str) -> bool {
+    let id_ok = |id: &str| !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    run == "claude" || run.strip_prefix("claude --resume ").is_some_and(id_ok)
 }
 
 fn now() -> u64 {
@@ -548,14 +778,19 @@ fn ago(t: u64) -> String {
     }
 }
 
-/// Session file text: a header, then the tree in pre-order (a `split` line is followed by its two children).
+/// Session file text: a header, then the tree in pre-order (a `split` line is followed by its two
+/// children). A pane line is `pane <folder>\t<name>`, then `\t<command>` when it has one.
 fn session_text(s: &Session) -> String {
-    fn node(n: &Node, panes: &[(String, String)], out: &mut String) {
+    fn node(n: &Node, panes: &[SavedPane], out: &mut String) {
         match n {
             Node::Leaf(i) => {
-                let (cwd, name) = panes.get(*i).map_or(("", ""), |(c, n)| (c.as_str(), n.as_str()));
+                let p = panes.get(*i).cloned().unwrap_or_default();
                 let clean = |t: &str| t.replace(['\t', '\r', '\n'], " ");
-                out.push_str(&format!("pane {}\t{}\n", clean(cwd), clean(name)));
+                out.push_str(&format!("pane {}\t{}", clean(&p.cwd), clean(&p.name)));
+                if !p.run.is_empty() {
+                    out.push_str(&format!("\t{}", clean(&p.run)));
+                }
+                out.push('\n');
             }
             Node::Split { side_by_side, ratio, a, b } => {
                 out.push_str(&format!("split {} {ratio:.3}\n", if *side_by_side { "side" } else { "stack" }));
@@ -579,11 +814,12 @@ fn session_text(s: &Session) -> String {
 
 /// The session in `session_text` form, or `None` when anything is off.
 fn parse_session(text: &str) -> Option<Session> {
-    fn node<'a>(lines: &mut impl Iterator<Item = &'a str>, panes: &mut Vec<(String, String)>, depth: usize) -> Option<Node> {
+    fn node<'a>(lines: &mut impl Iterator<Item = &'a str>, panes: &mut Vec<SavedPane>, depth: usize) -> Option<Node> {
         let line = lines.next()?;
         if let Some(rest) = line.strip_prefix("pane ") {
-            let (cwd, name) = rest.split_once('\t').unwrap_or((rest, ""));
-            panes.push((cwd.trim().into(), name.trim().into()));
+            let mut fields = rest.split('\t').map(|f| f.trim().to_string());
+            let mut field = || fields.next().unwrap_or_default();
+            panes.push(SavedPane { cwd: field(), name: field(), run: field() });
             return Some(Node::Leaf(panes.len() - 1));
         }
         let mut parts = line.strip_prefix("split ")?.split(' ');
@@ -636,8 +872,19 @@ fn data_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("APPDATA").map(|d| std::path::PathBuf::from(d).join("dterm"))
 }
 
-/// One choice on the landing page. `file` and `session` are `None` for a new session; `saved`
-/// ones can be deleted. `created` / `closed` are ready to show ("today 15:42"), empty if unknown.
+/// What a landing page choice is: a new session, the last one, a saved one (these can be
+/// deleted), or the session that is running behind the page (after Ctrl+Alt+H).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Kind {
+    New,
+    Last,
+    Saved,
+    Live,
+}
+
+/// One choice on the landing page. `file` is the session's file, `None` for a new or the running
+/// session; `session` is `None` only for a new one. `created` / `closed` are ready to show
+/// ("today 15:42"), empty if unknown.
 struct Choice {
     label: String,
     detail: String,
@@ -645,33 +892,32 @@ struct Choice {
     closed: String,
     file: Option<std::path::PathBuf>,
     session: Option<Session>,
-    saved: bool,
+    kind: Kind,
 }
 
-/// The landing page: its choices, the selected one, and whether Del was pressed once on it.
+/// The landing page: its choices, the selected one, whether Del was pressed once on it, and
+/// whether Enter was pressed once to leave the running session for it.
 struct Landing {
     rows: Vec<Choice>,
     sel: usize,
     armed: bool,
+    leaving: bool,
 }
 
 fn pane_count(n: usize) -> String {
     format!("{n} pane{}", if n == 1 { "" } else { "s" })
 }
 
+/// A choice for session `s`, with its times in words (see `ago`).
+fn choice(label: String, s: Session, file: Option<std::path::PathBuf>, kind: Kind, stamp: &dyn Fn(u64) -> String) -> Choice {
+    let (created, closed) = (stamp(s.created), if kind == Kind::Live { String::new() } else { stamp(s.closed) });
+    Choice { label, detail: pane_count(s.panes.len()), created, closed, file, session: Some(s), kind }
+}
+
 /// The landing page's choices: new session, the last one, then saved ones by name. Unreadable
 /// files are left out. `stamp` turns a Unix time into words (see `ago`).
 fn landing_rows(dir: &std::path::Path, stamp: &dyn Fn(u64) -> String) -> Vec<Choice> {
     let read = |f: &std::path::Path| std::fs::read_to_string(f).ok().and_then(|t| parse_session(&t));
-    let choice = |label: String, s: Session, file, saved| Choice {
-        label,
-        detail: pane_count(s.panes.len()),
-        created: stamp(s.created),
-        closed: stamp(s.closed),
-        file: Some(file),
-        session: Some(s),
-        saved,
-    };
     let new = Choice {
         label: "New session".into(),
         detail: String::new(),
@@ -679,12 +925,12 @@ fn landing_rows(dir: &std::path::Path, stamp: &dyn Fn(u64) -> String) -> Vec<Cho
         closed: String::new(),
         file: None,
         session: None,
-        saved: false,
+        kind: Kind::New,
     };
     let mut rows = vec![new];
     let last = dir.join("last.session");
     if let Some(s) = read(&last) {
-        rows.push(choice("Last session".into(), s, last, false));
+        rows.push(choice("Last session".into(), s, Some(last), Kind::Last, stamp));
     }
     let mut saved: Vec<Choice> = std::fs::read_dir(dir.join("sessions"))
         .into_iter()
@@ -695,7 +941,7 @@ fn landing_rows(dir: &std::path::Path, stamp: &dyn Fn(u64) -> String) -> Vec<Cho
         .filter_map(|f| {
             let s = read(&f)?;
             let label = f.file_stem()?.to_string_lossy().into_owned();
-            Some(choice(label, s, f, true))
+            Some(choice(label, s, Some(f), Kind::Saved, stamp))
         })
         .collect();
     saved.sort_by_key(|c| c.label.to_lowercase());
@@ -715,12 +961,24 @@ fn land_line(cell_h: f32) -> f32 {
     cell_h + 12.0
 }
 
-/// A preview name for a saved pane: its typed name, else its folder ("~" for home or unknown).
-fn preview_name((cwd, name): &(String, String), home: Option<&str>) -> String {
-    if !name.is_empty() {
-        return name.clone();
+/// The line under the landing page's preview: what a new session is, or when a saved one was
+/// started and closed (nothing for sessions saved before dterm recorded times).
+fn preview_caption(new: bool, created: &str, closed: &str) -> String {
+    match (created, closed) {
+        _ if new => "a fresh shell in your home folder".into(),
+        ("", "") => String::new(),
+        ("", c) => format!("closed {c}"),
+        (s, "") => format!("started {s}"),
+        (s, c) => format!("started {s}  \u{b7}  closed {c}"),
     }
-    let cwd = cwd.trim_end_matches(['\\', '/']);
+}
+
+/// A preview name for a saved pane: its typed name, else its folder ("~" for home or unknown).
+fn preview_name(p: &SavedPane, home: Option<&str>) -> String {
+    if !p.name.is_empty() {
+        return p.name.clone();
+    }
+    let cwd = p.cwd.trim_end_matches(['\\', '/']);
     if cwd.is_empty() || home.is_some_and(|h| h.trim_end_matches(['\\', '/']).eq_ignore_ascii_case(cwd)) {
         return "~".into();
     }
@@ -755,6 +1013,28 @@ fn caret_move(p: Point, (dx, dy): (i32, i32), cols: usize, top: i32, bottom: i32
     let i = (p.line.0 - top) as i64 * c + p.column.0 as i64 + dx as i64 + dy as i64 * c;
     let i = i.clamp(0, (bottom + 1 - top) as i64 * c);
     Point::new(Line(top + (i / c) as i32), Column((i % c) as usize))
+}
+
+/// Caret (cell index) after a word step from `at`: right goes past the end of the next word, left
+/// to the start of the previous one. Cells are `0..end`; `word(i)` says whether cell `i` is in a word.
+fn word_move(at: i64, right: bool, end: i64, word: impl Fn(i64) -> bool) -> i64 {
+    let mut i = at;
+    if right {
+        while i < end && !word(i) {
+            i += 1;
+        }
+        while i < end && word(i) {
+            i += 1;
+        }
+    } else {
+        while i > 0 && !word(i - 1) {
+            i -= 1;
+        }
+        while i > 0 && word(i - 1) {
+            i -= 1;
+        }
+    }
+    i
 }
 
 /// Scrollback lines for a wheel `delta` (120 per notch): 3 per notch, at least 1 per event.
@@ -903,6 +1183,7 @@ struct Pane {
     head: Option<Point>,        // free end of a Shift+arrow selection: the boundary left of this cell
     names: Arc<Mutex<Names>>,   // filled from window titles
     custom: Option<String>,     // name the user typed
+    pid: Option<u32>,           // the shell's process
 }
 
 impl Pane {
@@ -941,8 +1222,9 @@ impl Pane {
     }
 
     /// Shift+arrows: move the selection's free end by a character or a line, starting at the cursor.
+    /// With `words`, Left / Right move to the start of the previous / end of the next word.
     // ponytail: the end is not rotated if output scrolls the terminal meanwhile; fine while typing at a prompt.
-    fn extend_selection(&mut self, d: (i32, i32)) {
+    fn extend_selection(&mut self, d: (i32, i32), words: bool) {
         let mut t = self.term.lock();
         t.scroll_display(Scroll::Bottom); // the cursor is down there
         let head = match self.head.filter(|_| t.selection.is_some()) {
@@ -954,7 +1236,18 @@ impl Pane {
             }
         };
         let (cols, top, bottom) = (t.columns(), t.topmost_line().0, t.bottommost_line().0);
-        let head = caret_move(head, d, cols, top, bottom);
+        let head = if words && d.0 != 0 {
+            // Cells counted from the top-left of the scrollback; a word is anything but blanks
+            // and the characters a double-click stops at.
+            let c = cols as i64;
+            let point = |i: i64| Point::new(Line(top + (i / c) as i32), Column((i % c) as usize));
+            let stops = t.semantic_escape_chars();
+            let is_word = |i: i64| !matches!(t.grid()[point(i)].c, ' ' | '\0') && !stops.contains(t.grid()[point(i)].c);
+            let at = (head.line.0 - top) as i64 * c + head.column.0 as i64;
+            point(word_move(at, d.0 > 0, (bottom + 1 - top) as i64 * c, is_word))
+        } else {
+            caret_move(head, d, cols, top, bottom)
+        };
         self.head = Some(head);
         let (end, side) = if head.line.0 > bottom {
             (Point::new(Line(bottom), Column(cols - 1)), Side::Right) // the end of the last cell
@@ -994,9 +1287,18 @@ struct App {
     mouse: Option<(f32, f32)>,   // last mouse position in DIPs; None once it left the window
     tracking: bool,              // WM_MOUSELEAVE is requested
     landing: Option<Landing>,    // the start page, shown before any pane exists
-    prompt: Option<String>,      // session name being typed for Ctrl+Shift+S
+    prompt: Option<String>,      // session name being typed for the save-session shortcut
     toast: Option<String>,       // short note after saving
     created: u64,                // when this session started (Unix seconds), kept across restores
+    settings: Settings,
+    page: Option<SettingsPage>,  // the settings page, shown over the panes or the landing page
+}
+
+/// The settings page: the selected row (theme, opacity, then one per action) and whether it waits
+/// for the new keys of the selected action.
+struct SettingsPage {
+    sel: usize,
+    capture: bool,
 }
 
 impl App {
@@ -1030,12 +1332,15 @@ impl App {
     fn session(&self) -> Option<Session> {
         let tree = self.tree.as_ref()?;
         let order = tree.ids();
+        let procs = unsafe { processes() };
+        let mut taken = Vec::new(); // Claude Code conversations already given to a pane
         let panes = order
             .iter()
             .map(|id| {
                 let p = self.panes.iter().find(|p| p.id == *id);
                 let cwd = p.and_then(|p| p.names.lock().ok()?.win.clone()).unwrap_or_default();
-                (cwd, p.and_then(|p| p.custom.clone()).unwrap_or_default())
+                let run = p.and_then(|p| claude_run(&procs, p.pid?, &cwd, &mut taken)).unwrap_or_default();
+                SavedPane { cwd, name: p.and_then(|p| p.custom.clone()).unwrap_or_default(), run }
             })
             .collect();
         let focused = self.panes.get(self.focus).map(|p| p.id);
@@ -1077,6 +1382,94 @@ unsafe fn git_bash() -> String {
     "C:\\Program Files\\Git\\bin\\bash.exe".into()
 }
 
+/// (pid, parent pid, exe name) of every running process.
+unsafe fn processes() -> Vec<(u32, u32, String)> {
+    let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return Vec::new() };
+    let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+    let mut out = Vec::new();
+    let mut more = Process32FirstW(snap, &mut e).is_ok();
+    while more {
+        let n = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+        out.push((e.th32ProcessID, e.th32ParentProcessID, String::from_utf16_lossy(&e.szExeFile[..n])));
+        more = Process32NextW(snap, &mut e).is_ok();
+    }
+    let _ = CloseHandle(snap);
+    out
+}
+
+/// A process named `name` (any case) among the descendants of process `root`.
+fn descendant(procs: &[(u32, u32, String)], root: u32, name: &str) -> Option<u32> {
+    let mut seen = vec![root]; // also guards against loops from reused pids
+    let mut i = 0;
+    while let Some(&parent) = seen.get(i) {
+        for (pid, ppid, exe) in procs {
+            if *ppid == parent && !seen.contains(pid) {
+                if exe.eq_ignore_ascii_case(name) {
+                    return Some(*pid);
+                }
+                seen.push(*pid);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// When process `pid` started, in Unix seconds.
+unsafe fn started(pid: u32) -> Option<u64> {
+    let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+    let mut t = [FILETIME::default(); 4]; // creation, exit, kernel, user
+    let ok = GetProcessTimes(h, &mut t[0], &mut t[1], &mut t[2], &mut t[3]).is_ok();
+    let _ = CloseHandle(h);
+    let ticks = (t[0].dwHighDateTime as u64) << 32 | t[0].dwLowDateTime as u64;
+    ok.then(|| (ticks / 10_000_000).saturating_sub(11_644_473_600))
+}
+
+/// Claude Code's folder for the conversations started in `cwd`: `.claude\projects\<cwd with every
+/// character but ASCII letters and digits turned into ->`.
+fn claude_project(cwd: &str) -> Option<std::path::PathBuf> {
+    let home = || std::env::var_os("USERPROFILE").map(|h| std::path::PathBuf::from(h).join(".claude"));
+    let base = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from).or_else(home)?;
+    let name: String = cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    Some(base.join("projects").join(name))
+}
+
+/// Ids of the conversations in Claude Code folder `dir` written to since `since` (Unix seconds), newest first.
+fn recent_conversations(dir: &std::path::Path, since: u64) -> Vec<String> {
+    let mut found: Vec<(u64, String)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension()? != "jsonl" {
+                return None;
+            }
+            let modified = e.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+            (modified >= since).then_some((modified, path.file_stem()?.to_string_lossy().into_owned()))
+        })
+        .collect();
+    found.sort_by_key(|f| std::cmp::Reverse(f.0));
+    found.into_iter().map(|f| f.1).collect()
+}
+
+/// The command that brings back Claude Code if it runs under shell process `shell` in `cwd`: its
+/// newest conversation that no other pane has `taken`, or a fresh `claude` when it has none yet.
+// ponytail: two Claude panes in one folder may swap conversations; matching by open file handles would pin them.
+fn claude_run(procs: &[(u32, u32, String)], shell: u32, cwd: &str, taken: &mut Vec<String>) -> Option<String> {
+    let pid = descendant(procs, shell, "claude.exe")?;
+    let since = unsafe { started(pid) }.unwrap_or(0);
+    let ids = claude_project(cwd).map(|d| recent_conversations(&d, since)).unwrap_or_default();
+    Some(match ids.into_iter().find(|id| !taken.contains(id)) {
+        Some(id) => {
+            let run = format!("claude --resume {id}");
+            taken.push(id);
+            run
+        }
+        None => "claude".into(),
+    })
+}
+
 fn window_size((cols, lines): (usize, usize), cell: (f32, f32), scale: f32) -> WindowSize {
     WindowSize {
         num_lines: lines as u16,
@@ -1098,6 +1491,7 @@ fn spawn(hwnd: HWND, id: usize, bash: &str, cell: (f32, f32), scale: f32, dir: O
         escape_args: true,
     };
     let pty = tty::new(&opts, window_size(size, cell, scale), 0)?;
+    let pid = pty.child_watcher().pid().map(|p| p.get());
     let slot = Arc::new(OnceLock::new());
     let names = Arc::new(Mutex::new(Names::default()));
     let proxy = Proxy { hwnd: hwnd.0 as isize, id, tx: slot.clone(), names: names.clone() };
@@ -1106,7 +1500,7 @@ fn spawn(hwnd: HWND, id: usize, bash: &str, cell: (f32, f32), scale: f32, dir: O
     let tx = event_loop.channel();
     let _ = slot.set(tx.clone());
     event_loop.spawn();
-    Ok(Pane { id, term, tx, size, rect: (0.0, 0.0, 0.0, 0.0), origin: (PAD, PAD), head: None, names, custom: None })
+    Ok(Pane { id, term, tx, size, rect: (0.0, 0.0, 0.0, 0.0), origin: (PAD, PAD), head: None, names, custom: None, pid })
 }
 
 unsafe fn scale(hwnd: HWND) -> f32 {
@@ -1225,6 +1619,11 @@ unsafe fn remove_pane(hwnd: HWND, id: usize) {
         Some(a.panes.len())
     });
     match left {
+        // Behind the landing page the running session just ends: its choice goes away.
+        Some(0) if with(|a| a.landing.as_mut().map(|l| l.rows.retain(|r| r.kind != Kind::Live)).is_some()) => {
+            with(|a| a.landing.as_mut().map(|l| (l.sel, l.leaving) = (0, false)));
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
         Some(0) => {
             let _ = DestroyWindow(hwnd);
         }
@@ -1254,34 +1653,42 @@ unsafe fn paint(hwnd: HWND) {
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             // Aliased shapes tile exactly, so cell backgrounds leave no seams between rows.
             rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
-            let Ok(brush) = rt.CreateSolidColorBrush(&color(rgb(FG), 1.0), None) else { return };
+            let Ok(brush) = rt.CreateSolidColorBrush(&color(fg(), 1.0), None) else { return };
             a.target = Some((rt, brush));
         }
         let (rt, brush) = a.target.as_ref().unwrap();
         rt.BeginDraw();
+        if let Some(page) = &a.page {
+            rt.Clear(Some(&color(bg(), a.settings.opacity)));
+            draw_settings(a, page, rt, brush);
+            if rt.EndDraw(None, None).is_err() {
+                a.target = None;
+            }
+            return;
+        }
         if let Some(l) = &a.landing {
-            rt.Clear(Some(&color(rgb(BG), OPACITY)));
+            rt.Clear(Some(&color(bg(), a.settings.opacity)));
             draw_landing(a, l, rt, brush, w as f32 / s);
             if rt.EndDraw(None, None).is_err() {
                 a.target = None;
             }
             return;
         }
-        rt.Clear(Some(&color(rgb(GAP_COLOR), 0.9)));
+        rt.Clear(Some(&color(rgb(theme().gap), 0.9)));
         let (several, labeled) = (a.view == View::Grid && a.panes.len() > 1, a.labeled());
         for (i, p) in a.panes.iter().enumerate().filter(|&(i, _)| a.is_shown(i)) {
             let (x, y, pw, ph) = p.rect;
             let (r, focused) = (rect(x, y, pw, ph), i == a.focus);
             // Clear() inside the clip replaces the pixels, so the pane gets its own see-through tint.
             rt.PushAxisAlignedClip(&r, D2D1_ANTIALIAS_MODE_ALIASED);
-            rt.Clear(Some(&color(rgb(BG), OPACITY)));
+            rt.Clear(Some(&color(bg(), a.settings.opacity)));
             draw_term(rt, brush, &a.format, &a.bold, a.cell, p.origin, focused, &p.term.lock());
             // Several panes: a faint border marks the focused one, a veil dims the others.
             if several && focused {
-                brush.SetColor(&color(rgb(FG), FOCUS_ALPHA));
+                brush.SetColor(&color(fg(), FOCUS_ALPHA));
                 rt.DrawRectangle(&rect(x + 0.5, y + 0.5, pw - 1.0, ph - 1.0), brush, 1.0, None);
             } else if several {
-                brush.SetColor(&color(rgb(BG), VEIL_ALPHA));
+                brush.SetColor(&color(bg(), VEIL_ALPHA));
                 rt.FillRectangle(&r, brush);
             }
             if labeled {
@@ -1289,7 +1696,7 @@ unsafe fn paint(hwnd: HWND) {
                     Some((_, typed)) => (format!("{typed}\u{258f}"), 1.0), // the name being typed, with a caret
                     None => (p.name(a.home.as_deref()).unwrap_or_default(), if focused { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }),
                 };
-                brush.SetColor(&color(rgb(FG), alpha));
+                brush.SetColor(&color(fg(), alpha));
                 let units: Vec<u16> = text.encode_utf16().collect();
                 let slot = rect(x + PAD, y, pw - 2.0 * PAD, LABEL_TOP);
                 rt.DrawText(&units, &a.label, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
@@ -1297,15 +1704,15 @@ unsafe fn paint(hwnd: HWND) {
             rt.PopAxisAlignedClip();
         }
         draw_chrome(a, rt, brush, w as f32 / s);
-        // The Ctrl+Shift+S prompt, or the note after saving: one small line near the bottom.
+        // The save-session prompt, or the note after saving: one small line near the bottom.
         let note = a.prompt.as_ref().map(|t| (format!("save session as: {t}\u{258f}"), 0.9)).or(a.toast.clone().map(|t| (t, 0.6)));
         if let Some((text, alpha)) = note {
             let (cw, ch) = (w as f32 / s, h as f32 / s);
             let bw = 380f32.min(cw - 16.0);
             let r = rect((cw - bw) / 2.0, ch - 56.0, bw, 30.0);
-            brush.SetColor(&color(rgb(BG), 0.95));
+            brush.SetColor(&color(bg(), 0.95));
             rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 6.0, radiusY: 6.0 }, brush);
-            brush.SetColor(&color(rgb(FG), alpha));
+            brush.SetColor(&color(fg(), alpha));
             let units: Vec<u16> = text.encode_utf16().collect();
             rt.DrawText(&units, &a.tab, &r, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
         }
@@ -1331,10 +1738,17 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
     // The logo, as on the icon, and a tagline.
     if let Ok(big) = text_format(&a.dw, DWRITE_FONT_WEIGHT_BOLD, LOGO_SIZE) {
         let r = rect(LAND_X, LAND_Y, 4000.0, LOGO_SIZE * 1.4);
-        text("D_", &big, r, GREEN, 1.0);
-        text("   dterm", &big, r, FG, 0.95); // monospace: three cells to the right of "D_"
+        text("D_", &big, r, theme().ansi[2], 1.0);
+        text("   dterm", &big, r, theme().fg, 0.95); // monospace: three cells to the right of "D_"
     }
-    line("terminals in a grid, sessions that come back", LAND_X + 2.0, LAND_Y + LOGO_SIZE * 1.45, FG, 0.4);
+    let tagline = format!("terminals in a grid, sessions that come back  \u{b7}  v{}", env!("CARGO_PKG_VERSION"));
+    let live = l.rows.iter().any(|r| r.kind == Kind::Live);
+    let keys = format!("\u{2191}\u{2193} choose   Enter open   Del delete   Esc {}", if live { "back" } else { "new" });
+    // The shortcuts that matter here, as set on the settings page.
+    let shortcut = |act: Action, what: &str| a.settings.keys[act as usize].map(|k| format!("{} {what}", chord_text(k)));
+    let more = [shortcut(Action::Save, "saves a session"), shortcut(Action::Home, "comes back here"), shortcut(Action::Settings, "settings")];
+    let more = more.into_iter().flatten().collect::<Vec<_>>().join("   ");
+    line(&tagline, LAND_X + 2.0, LAND_Y + LOGO_SIZE * 1.45, theme().fg, 0.4);
 
     // The choices: label, pane count, when it was last closed.
     let chars = |f: fn(&Choice) -> &String| l.rows.iter().map(|r| f(r).chars().count()).max().unwrap_or(0) as f32;
@@ -1345,52 +1759,54 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
         let y = LAND_ROWS + i as f32 * lh;
         let on = i == l.sel;
         if on {
-            brush.SetColor(&color(rgb(FG), 0.07));
+            brush.SetColor(&color(fg(), 0.07));
             let bar = D2D1_ROUNDED_RECT { rect: rect(LAND_X - 12.0, y, list_w + 12.0, lh), radiusX: 6.0, radiusY: 6.0 };
             rt.FillRoundedRectangle(&bar, brush);
-            line("\u{276f}", LAND_X, y, GREEN, 1.0);
+            line("\u{276f}", LAND_X, y, theme().ansi[2], 1.0);
         }
-        line(&row.label, LAND_X + 2.0 * cw, y, FG, if on { 1.0 } else { 0.6 });
-        line(&row.detail, LAND_X + (4.0 + lw) * cw, y, FG, if on { 0.6 } else { 0.4 });
-        if !row.closed.is_empty() {
-            line(&format!("closed {}", row.closed), closed_x, y, FG, if on { 0.5 } else { 0.3 });
+        line(&row.label, LAND_X + 2.0 * cw, y, theme().fg, if on { 1.0 } else { 0.6 });
+        line(&row.detail, LAND_X + (4.0 + lw) * cw, y, theme().fg, if on { 0.6 } else { 0.4 });
+        if row.kind == Kind::Live {
+            line("running", closed_x, y, theme().ansi[2], if on { 0.9 } else { 0.6 });
+        } else if !row.closed.is_empty() {
+            line(&format!("closed {}", row.closed), closed_x, y, theme().fg, if on { 0.5 } else { 0.3 });
         }
     }
 
-    // What the selected choice opens: its layout in miniature, with each pane's name.
-    let px = LAND_X + list_w + 48.0;
+    // What the selected choice opens: its layout in miniature, with each pane's name, right of
+    // everything on the left (the list and the hint lines below it).
+    let texts = [&tagline, &keys, &more].iter().map(|t| t.chars().count()).max().unwrap_or(0) as f32;
+    let px = LAND_X + list_w.max(texts * cw) + 48.0;
     let Some(row) = l.rows.get(l.sel) else { return };
     if px + PREVIEW.0 <= width - 24.0 {
         let one = Node::Leaf(0);
-        let fresh = [(String::new(), String::new())];
+        let fresh = [SavedPane::default()];
         let (tree, panes) = row.session.as_ref().map_or((&one, &fresh[..]), |s| (&s.tree, &s.panes[..]));
         for (i, (x, y, w, h)) in tree.rects((px, LAND_ROWS, PREVIEW.0, PREVIEW.1)) {
             let r = rect(x, y, w, h);
             let pane = D2D1_ROUNDED_RECT { rect: r, radiusX: 4.0, radiusY: 4.0 };
-            brush.SetColor(&color(rgb(BG), 0.6));
+            brush.SetColor(&color(bg(), 0.6));
             rt.FillRoundedRectangle(&pane, brush);
-            brush.SetColor(&color(rgb(FG), 0.18));
+            brush.SetColor(&color(fg(), 0.18));
             rt.DrawRoundedRectangle(&pane, brush, 1.0, None);
             let name = if row.session.is_some() { preview_name(&panes[i], a.home.as_deref()) } else { "Git Bash \u{b7} ~".into() };
-            text(&name, &a.tab, r, FG, 0.65);
+            text(&name, &a.tab, r, theme().fg, 0.65);
         }
-        let caption = match (row.created.as_str(), row.closed.as_str()) {
-            ("", "") => "a fresh shell in your home folder".to_string(),
-            ("", c) => format!("closed {c}"),
-            (s, "") => format!("started {s}"),
-            (s, c) => format!("started {s}  \u{b7}  closed {c}"),
-        };
-        text(&caption, &a.tab, rect(px - 60.0, LAND_ROWS + PREVIEW.1 + 8.0, PREVIEW.0 + 120.0, 24.0), FG, 0.4);
+        let caption = preview_caption(row.session.is_none(), &row.created, &row.closed);
+        text(&caption,&a.tab, rect(px - 60.0, LAND_ROWS + PREVIEW.1 + 8.0, PREVIEW.0 + 120.0, 24.0), theme().fg, 0.4);
     }
 
-    // Keys, or the delete question.
+    // Keys, or the delete or leave question.
     let y = LAND_ROWS + (l.rows.len() as f32 + 1.0) * lh;
     if l.armed {
-        line(&format!("press Del again to delete \u{201c}{}\u{201d}", row.label), LAND_X, y, RED, 0.9);
+        line(&format!("press Del again to delete \u{201c}{}\u{201d}", row.label), LAND_X, y, theme().ansi[1], 0.9);
+    } else if l.leaving {
+        let what = format!("press Enter again to close this session and open \u{201c}{}\u{201d}", row.label);
+        line(&what, LAND_X, y, theme().ansi[3], 0.9);
     } else {
-        line("\u{2191}\u{2193} choose   Enter open   Del delete   Esc new", LAND_X, y, FG, 0.4);
+        line(&keys, LAND_X, y, theme().fg, 0.4);
     }
-    line("in a session, Ctrl+Shift+S saves it under a name", LAND_X, y + lh, FG, 0.25);
+    line(&more, LAND_X, y + lh, theme().fg, 0.25);
 }
 
 /// The view button, and in Tabs view the strip with a tab per pane, over the panes.
@@ -1400,10 +1816,10 @@ unsafe fn draw_chrome(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCol
     if tabs {
         // The strip has the same tint as the panes, so the tabs sit right on the acrylic.
         rt.PushAxisAlignedClip(&rect(0.0, 0.0, width, TAB_H), D2D1_ANTIALIAS_MODE_ALIASED);
-        rt.Clear(Some(&color(rgb(BG), OPACITY)));
+        rt.Clear(Some(&color(bg(), a.settings.opacity)));
         rt.PopAxisAlignedClip();
         let order = a.order();
-        let tw = tab_width(order.len(), width - TAB_H);
+        let tw = tab_width(order.len(), width - 2.0 * TAB_H);
         let focused = a.panes.get(a.focus).map(|p| p.id);
         for (n, p) in order.iter().filter_map(|id| a.panes.iter().find(|p| p.id == *id)).enumerate() {
             let active = focused == Some(p.id);
@@ -1419,22 +1835,29 @@ unsafe fn draw_chrome(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCol
                 }
             };
             let (x, room) = (n as f32 * tw + TAB_PAD, (tw - 2.0 * TAB_PAD).max(0.0));
-            brush.SetColor(&color(rgb(FG), alpha));
+            brush.SetColor(&color(fg(), alpha));
             let units: Vec<u16> = text.encode_utf16().collect();
             rt.DrawText(&units, &a.tab, &rect(x, 0.0, room, TAB_H), brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
             if active {
-                brush.SetColor(&color(rgb(FG), UNDERLINE_ALPHA));
+                brush.SetColor(&color(fg(), UNDERLINE_ALPHA));
                 rt.FillRectangle(&rect(x, TAB_H - 2.0, room, 2.0), brush);
             }
         }
     } else if near {
-        // A backing keeps the button legible over a pane's name or first line.
-        brush.SetColor(&color(rgb(BG), 0.9));
-        rt.FillRectangle(&rect(width - TAB_H, 0.0, TAB_H, TAB_H), brush);
+        // A backing keeps the buttons legible over a pane's name or first line.
+        brush.SetColor(&color(bg(), 0.9));
+        rt.FillRectangle(&rect(width - 2.0 * TAB_H, 0.0, 2.0 * TAB_H, TAB_H), brush);
     }
     if tabs || near {
+        // To the start page: three lines, like the list of sessions there.
+        let hot = hit == Some(Hit::Home);
+        brush.SetColor(&color(fg(), if hot { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }));
+        let (x, y) = ((width - 1.5 * TAB_H - 6.0).round(), (TAB_H / 2.0 - 5.0).round());
+        for dy in [0.0, 4.5, 9.0] {
+            rt.FillRectangle(&rect(x, (y + dy).round(), 12.0, 1.5), brush);
+        }
         let hot = hit == Some(Hit::Button);
-        brush.SetColor(&color(rgb(FG), if hot { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }));
+        brush.SetColor(&color(fg(), if hot { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }));
         let (cx, cy) = (width - TAB_H / 2.0, TAB_H / 2.0);
         if tabs {
             // Back to the grid: 2 x 2 tiny squares.
@@ -1488,16 +1911,17 @@ unsafe fn draw_term(
         run.clear();
     };
 
+    let base = (fg(), bg()); // the theme's; `fg` and `bg` below are the cell's
     for cell in content.display_iter {
         let flags = cell.flags;
         if flags.contains(Flags::WIDE_CHAR_SPACER) {
             continue;
         }
         let bold = flags.contains(Flags::BOLD);
-        let mut fg = resolve(cell.fg, bold, content.colors).unwrap_or(rgb(BG));
+        let mut fg = resolve(cell.fg, bold, content.colors).unwrap_or(base.1);
         let mut bg = resolve(cell.bg, false, content.colors);
         if flags.contains(Flags::INVERSE) {
-            (fg, bg) = (bg.unwrap_or(rgb(BG)), Some(fg));
+            (fg, bg) = (bg.unwrap_or(base.1), Some(fg));
         }
         if flags.contains(Flags::DIM) {
             fg = dim(fg);
@@ -1509,7 +1933,7 @@ unsafe fn draw_term(
         let selected = !(is_cursor && shape == CursorShape::Block)
             && selection.is_some_and(|s| s.contains_cell(&cell, cursor.point, shape));
         if is_cursor && shape == CursorShape::Block {
-            (fg, bg) = (bg.unwrap_or(rgb(BG)), Some(fg));
+            (fg, bg) = (bg.unwrap_or(base.1), Some(fg));
         }
 
         if let Some(b) = bg {
@@ -1520,11 +1944,11 @@ unsafe fn draw_term(
         // Selection: a light veil over the cell, like Windows Terminal; the text keeps its color.
         if selected {
             flush(&mut run, run_at, run_style);
-            brush.SetColor(&color(rgb(FG), SELECTION_ALPHA));
+            brush.SetColor(&color(base.0, SELECTION_ALPHA));
             rt.FillRectangle(&rect(x, y, width, ch), brush);
         }
         if is_cursor {
-            brush.SetColor(&color(rgb(FG), 1.0));
+            brush.SetColor(&color(base.0, 1.0));
             match shape {
                 CursorShape::Beam => rt.FillRectangle(&rect(x, y, 2.0, ch), brush),
                 CursorShape::Underline => rt.FillRectangle(&rect(x, y + ch - 2.0, width, 2.0), brush),
@@ -1671,23 +2095,31 @@ fn save_last() {
     }
 }
 
-/// Open a saved session in the empty window: its panes start in their folders.
+/// Open a saved session in the empty window: its panes start in their folders, and Claude Code
+/// comes back in the panes that ran it.
 unsafe fn open_session(hwnd: HWND, s: Session) -> bool {
     set_font(hwnd, s.font);
     let scale = scale(hwnd);
     let opened = with(|a| {
+        // Fresh ids: exit notices from panes of a closed session may still be on their way.
+        let base = a.next_id;
         let mut panes = Vec::new();
-        for (id, (cwd, name)) in s.panes.iter().enumerate() {
-            let dir = Some(cwd.as_str()).filter(|c| !c.is_empty());
-            let Ok(mut p) = spawn(hwnd, id, &a.bash, a.cell, scale, dir) else {
+        for (i, saved) in s.panes.iter().enumerate() {
+            let dir = Some(saved.cwd.as_str()).filter(|c| !c.is_empty());
+            let Ok(mut p) = spawn(hwnd, base + i, &a.bash, a.cell, scale, dir) else {
                 panes.iter().for_each(|p: &Pane| drop(p.tx.send(Msg::Shutdown)));
                 return false;
             };
-            p.custom = (!name.is_empty()).then(|| name.clone());
+            p.custom = (!saved.name.is_empty()).then(|| saved.name.clone());
+            if resume_command(&saved.run) {
+                p.send(format!("{}\r", saved.run).into_bytes()); // typed ahead: the shell runs it once it is up
+            }
             panes.push(p);
         }
-        // Leaves are 0.. in tree order, the same as the ids just given out.
-        (a.panes, a.tree, a.next_id, a.view, a.focus) = (panes, Some(s.tree), s.panes.len(), s.view, s.focus);
+        // The leaves are numbered in tree order, the same order as the ids just given out.
+        let tree = s.tree.numbered(&mut base.clone());
+        (a.panes, a.tree, a.next_id, a.view) = (panes, Some(tree), base + s.panes.len(), s.view);
+        a.focus = s.focus;
         a.created = if s.created > 0 { s.created } else { now() };
         true
     });
@@ -1697,9 +2129,41 @@ unsafe fn open_session(hwnd: HWND, s: Session) -> bool {
     opened
 }
 
-/// Leave the landing page through choice `i`: a saved session, or a new one (also when the file
-/// can't be opened any more).
+/// Close every pane without closing the window (for the landing page to open another session).
+fn close_all(a: &mut App) {
+    for p in a.panes.drain(..) {
+        let _ = p.tx.send(Msg::Shutdown);
+    }
+    (a.tree, a.focus, a.view, a.drag, a.select, a.rename, a.prompt) = (None, 0, View::Grid, None, None, None, None);
+}
+
+/// Leave the landing page through choice `i`: back to the running session, a saved session, or a
+/// new one (also when the file can't be opened any more). With a session running behind the page,
+/// opening another one closes it, so the first Enter or click only asks.
 unsafe fn open_choice(hwnd: HWND, i: usize) {
+    let (live, kind) = with(|a| {
+        let l = a.landing.as_ref();
+        (l.is_some_and(|l| l.rows.iter().any(|r| r.kind == Kind::Live)), l.and_then(|l| l.rows.get(i)).map(|r| r.kind))
+    });
+    if kind == Some(Kind::Live) {
+        with(|a| a.landing = None);
+        layout(hwnd);
+        return;
+    }
+    if live {
+        let ask = with(|a| {
+            let Some(l) = a.landing.as_mut() else { return true };
+            let ask = !(l.leaving && l.sel == i);
+            (l.sel, l.leaving, l.armed) = (i, ask, false);
+            ask
+        });
+        if ask {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            return;
+        }
+        save_last();
+        with(close_all);
+    }
     let session = with(|a| {
         a.created = now(); // a new session starts now; a restored one takes its own time
         a.landing.take().and_then(|l| l.rows.into_iter().nth(i)).and_then(|c| c.session)
@@ -1714,13 +2178,30 @@ unsafe fn open_choice(hwnd: HWND, i: usize) {
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
-/// Keys on the landing page: ↑↓ choose, Enter opens, Esc starts a new session, Del (twice) deletes a saved one.
+/// Ctrl+Alt+H or the ≡ button: the landing page, with the running session as its first choice.
+/// The panes keep running behind it; the session is also saved as the last one.
+unsafe fn go_home(hwnd: HWND) {
+    save_last();
+    let rows = data_dir().map(|d| landing_rows(&d, &ago)).unwrap_or_default();
+    with(|a| {
+        let Some(s) = a.session() else { return };
+        // The last session is this one now, so it shows up only as the running one.
+        let mut rows: Vec<Choice> = rows.into_iter().filter(|r| r.kind != Kind::Last).collect();
+        rows.insert(0, choice("This session".into(), s, None, Kind::Live, &ago));
+        a.landing = Some(Landing { rows, sel: 0, armed: false, leaving: false });
+        (a.drag, a.select, a.rename, a.prompt) = (None, None, None, None);
+    });
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// Keys on the landing page: ↑↓ choose, Enter opens, Esc opens the first choice (the running
+/// session, else a new one), Del (twice) deletes a saved one.
 unsafe fn landing_key(hwnd: HWND, vk: u16) {
     match vk {
         0x26 | 0x28 => with(|a| {
             if let Some(l) = a.landing.as_mut() {
                 l.sel = cycle(l.rows.len(), l.sel, if vk == 0x26 { -1 } else { 1 });
-                l.armed = false;
+                (l.armed, l.leaving) = (false, false);
             }
         }),
         0x0D | 0x1B => {
@@ -1730,9 +2211,10 @@ unsafe fn landing_key(hwnd: HWND, vk: u16) {
         }
         0x2E => with(|a| {
             let Some(l) = a.landing.as_mut() else { return };
-            if !l.rows[l.sel].saved {
+            if l.rows[l.sel].kind != Kind::Saved {
                 return;
             }
+            l.leaving = false;
             if !std::mem::replace(&mut l.armed, true) {
                 return; // the first press only asks
             }
@@ -1748,7 +2230,107 @@ unsafe fn landing_key(hwnd: HWND, vk: u16) {
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
-/// Enter in the Ctrl+Shift+S prompt: save under the typed name and say so for a moment.
+/// Write the settings to `%APPDATA%\dterm\settings` and show them.
+unsafe fn apply_settings(hwnd: HWND) {
+    let s = with(|a| a.settings.clone());
+    THEME.store(s.theme, Ordering::Relaxed);
+    if let Some(d) = data_dir() {
+        let _ = std::fs::create_dir_all(&d).and_then(|_| std::fs::write(d.join("settings"), settings_text(&s)));
+    }
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// Keys on the settings page: ↑↓ choose, ←→ change the theme or opacity, Enter waits for new keys
+/// for a shortcut (Esc cancels), Del puts back its default, Esc closes the page.
+unsafe fn settings_key(hwnd: HWND, vk: u16, chord: Chord) {
+    drop_char(hwnd);
+    let rows = 2 + ACTIONS.len();
+    let changed = with(|a| {
+        let Some(page) = a.page.as_mut() else { return false };
+        let s = &mut a.settings;
+        let action = page.sel.checked_sub(2);
+        if page.capture {
+            page.capture = false;
+            match (vk, action) {
+                (0x1B, _) => {}
+                (_, Some(i)) if key_name(chord.vk).is_some() && (chord.ctrl || chord.alt) => s.bind(i, Some(chord)),
+                _ => page.capture = true, // a modifier on its own, or keys that can't be a shortcut: keep waiting
+            }
+            return !page.capture;
+        }
+        let step = match vk {
+            0x25 => -1,
+            0x27 | 0x0D => 1,
+            _ => 0,
+        };
+        match (vk, page.sel) {
+            (0x26 | 0x28, _) => page.sel = cycle(rows, page.sel, if vk == 0x26 { -1 } else { 1 }),
+            (0x1B, _) => a.page = None,
+            (_, 0) if step != 0 => s.theme = cycle(THEMES.len(), s.theme, step),
+            (_, 1) if step != 0 => s.opacity = (s.opacity + 0.05 * step as f32).clamp(MIN_OPACITY, 1.0),
+            (0x0D, _) => page.capture = true,
+            (0x2E | 0x08, i) if i >= 2 => s.bind(i - 2, parse_chord(ACTIONS[i - 2].3)),
+            _ => return false,
+        }
+        true
+    });
+    if changed {
+        apply_settings(hwnd);
+    }
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// The settings page, in the style of the landing page: a title, then a row per setting with its
+/// value (the selected one bright with a green ❯), the keys, and the shortcuts that can't change.
+unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush) {
+    let (cw, ch) = a.cell;
+    let lh = land_line(ch);
+    let line = |s: &str, x: f32, y: f32, c: u32, alpha: f32| {
+        brush.SetColor(&color(rgb(c), alpha));
+        let units: Vec<u16> = s.encode_utf16().collect();
+        let r = rect(x, y + (lh - ch) / 2.0, 4000.0, ch);
+        rt.DrawText(&units, &a.format, &r, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+    };
+    let t = theme();
+    line("settings", LAND_X, LAND_Y, t.ansi[2], 1.0);
+    let s = &a.settings;
+    let mut rows = vec![
+        ("Theme".to_string(), format!("\u{2039} {} \u{203a}", t.name)),
+        ("Opacity".to_string(), format!("\u{2039} {}% \u{203a}", (s.opacity * 100.0).round())),
+    ];
+    for (act, k) in ACTIONS.iter().zip(s.keys) {
+        rows.push((act.2.to_string(), k.map_or("none".into(), chord_text)));
+    }
+    let top = LAND_Y + 2.0 * lh;
+    let value_x = LAND_X + 18.0 * cw;
+    for (i, (label, value)) in rows.iter().enumerate() {
+        // A gap between the look and the shortcuts.
+        let y = top + i as f32 * lh + if i >= 2 { lh / 2.0 } else { 0.0 };
+        let on = i == page.sel;
+        let value = if on && page.capture { "press the new keys\u{2026}".to_string() } else { value.clone() };
+        if on {
+            brush.SetColor(&color(fg(), 0.07));
+            let bar = D2D1_ROUNDED_RECT { rect: rect(LAND_X - 12.0, y, 46.0 * cw, lh), radiusX: 6.0, radiusY: 6.0 };
+            rt.FillRoundedRectangle(&bar, brush);
+            line("\u{276f}", LAND_X, y, t.ansi[2], 1.0);
+        }
+        line(label, LAND_X + 2.0 * cw, y, t.fg, if on { 1.0 } else { 0.6 });
+        line(&value, value_x, y, if on && page.capture { t.ansi[3] } else { t.fg }, if on { 0.9 } else { 0.45 });
+    }
+    let y = top + (rows.len() as f32 + 1.5) * lh;
+    let keys = if page.capture {
+        "press a key with Ctrl or Alt   Esc cancel"
+    } else if page.sel < 2 {
+        "\u{2191}\u{2193} choose   \u{2190}\u{2192} change   Esc back"
+    } else {
+        "\u{2191}\u{2193} choose   Enter new keys   Del default   Esc back"
+    };
+    line(keys, LAND_X, y, t.fg, 0.4);
+    line("fixed: Alt+arrows focus   Alt+Shift+arrows resize   Ctrl+Alt+arrows swap   Ctrl+Tab next pane", LAND_X, y + lh, t.fg, 0.25);
+    line("Shift+arrows select (Ctrl: by word)   Ctrl+C / Ctrl+V copy, paste   Ctrl+Plus / Minus / 0 font", LAND_X, y + 2.0 * lh, t.fg, 0.25);
+}
+
+/// Enter in the save-session prompt: save under the typed name and say so for a moment.
 unsafe fn end_prompt(hwnd: HWND, keep: bool) {
     let typed = with(|a| a.prompt.take());
     if let (true, Some(name)) = (keep, typed.as_deref().and_then(session_file_name)) {
@@ -1759,7 +2341,7 @@ unsafe fn end_prompt(hwnd: HWND, keep: bool) {
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
-/// Ctrl+Shift+Z / Ctrl+Shift+G / the view button: switch to `to` or back to the grid (see `toggled`).
+/// The zoom and grid / tabs shortcuts, or the view button: switch to `to` or back to the grid (see `toggled`).
 unsafe fn toggle_view(hwnd: HWND, to: View) {
     let changed = with(|a| {
         let view = toggled(a.view, to);
@@ -1796,9 +2378,59 @@ unsafe fn update_title(hwnd: HWND) {
     }
 }
 
-/// Drop the WM_CHAR that TranslateMessage queued for the key being handled, if the key made one.
+/// Drop the WM_CHAR or WM_SYSCHAR that TranslateMessage queued for the key being handled, if the key made one.
 unsafe fn drop_char(hwnd: HWND) {
-    let _ = PeekMessageW(&mut MSG::default(), Some(hwnd), WM_CHAR, WM_CHAR, PM_REMOVE);
+    for m in [WM_CHAR, WM_SYSCHAR] {
+        let _ = PeekMessageW(&mut MSG::default(), Some(hwnd), m, m, PM_REMOVE);
+    }
+}
+
+/// Whether AltGr (right Alt) is held and key `vk` types a character with it on this keyboard
+/// layout, like AltGr+è = [ on an Italian keyboard. Then the character wins over a Ctrl+Alt
+/// shortcut (AltGr counts as Ctrl+Alt); left Ctrl + left Alt still give the shortcut.
+unsafe fn altgr_char(vk: u16, scan: u32) -> bool {
+    let mut state = [0u8; 256];
+    if GetKeyState(VK_RMENU.0 as i32) >= 0 || GetKeyboardState(&mut state).is_err() {
+        return false;
+    }
+    let mut out = [0u16; 8];
+    // Flag 4: leave the keyboard state alone, so a dead key still works for the real keystroke.
+    let n = ToUnicode(vk as u32, scan, Some(&state), &mut out, 4);
+    n != 0 && out[0] >= 0x20
+}
+
+/// Run a dterm command (see ACTIONS).
+unsafe fn run(hwnd: HWND, act: Action) {
+    drop_char(hwnd);
+    match act {
+        Action::NewPane | Action::SplitRight | Action::SplitDown => {
+            leave_zoom(hwnd);
+            let dir = match act {
+                Action::SplitRight => Some(true),
+                Action::SplitDown => Some(false),
+                _ => None,
+            };
+            add_pane(hwnd, dir);
+        }
+        Action::Close => {
+            if let Some(id) = with(|a| a.panes.get(a.focus).map(|p| p.id)) {
+                leave_zoom(hwnd);
+                remove_pane(hwnd, id);
+            }
+        }
+        Action::Rename => begin_rename(hwnd),
+        Action::Save => {
+            with(|a| (a.prompt, a.toast) = (Some(String::new()), None));
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        Action::Zoom => toggle_view(hwnd, View::Zoom),
+        Action::Tabs => toggle_view(hwnd, View::Tabs),
+        Action::Home => go_home(hwnd),
+        Action::Settings => {
+            with(|a| a.page = Some(SettingsPage { sel: 0, capture: false }));
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
 }
 
 unsafe fn modifiers() -> (bool, bool, bool) {
@@ -1806,17 +2438,40 @@ unsafe fn modifiers() -> (bool, bool, bool) {
     (down(VK_SHIFT), down(VK_MENU), down(VK_CONTROL))
 }
 
-/// Returns true when the key was handled here.
-unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
+/// Returns true when the key was handled here. `scan` is the key's scan code.
+unsafe fn on_key(hwnd: HWND, vk: u16, scan: u32) -> bool {
     let (shift, alt, ctrl) = modifiers();
-    // The landing page takes every key; Alt chords (Alt+F4) stay with the system.
-    if with(|a| a.landing.is_some()) {
-        if !alt {
-            landing_key(hwnd, vk);
+    let chord = chord_of(vk, shift, alt, ctrl);
+    // The settings page takes every key; Alt chords (Alt+F4) stay with the system unless it waits for new keys.
+    if with(|a| a.page.is_some()) {
+        let mine = !alt || ctrl || with(|a| a.page.as_ref().is_some_and(|p| p.capture));
+        if mine {
+            settings_key(hwnd, vk, chord);
         }
-        return !alt;
+        return mine;
     }
-    // Typing a session name (Ctrl+Shift+S): like renaming, keys edit it.
+    // A dterm shortcut, unless a name is being typed or AltGr makes a character with this key.
+    let typing = with(|a| a.prompt.is_some() || a.rename.is_some());
+    let action = with(|a| a.settings.action(chord)).filter(|_| !typing && !altgr_char(vk, scan));
+    // The landing page takes every key; Alt chords (Alt+F4) stay with the system. Of the
+    // shortcuts, settings and the start page (back to the running session) work there.
+    if with(|a| a.landing.is_some()) {
+        match action {
+            Some(Action::Settings) => run(hwnd, Action::Settings),
+            Some(Action::Home) if with(|a| a.landing.as_ref().is_some_and(|l| l.rows.iter().any(|r| r.kind == Kind::Live))) => {
+                drop_char(hwnd);
+                open_choice(hwnd, 0);
+            }
+            _ if !alt => landing_key(hwnd, vk),
+            _ => return false,
+        }
+        return true;
+    }
+    if let Some(act) = action {
+        run(hwnd, act);
+        return true;
+    }
+    // Typing a session name: like renaming, keys edit it.
     if with(|a| a.prompt.is_some()) {
         if !alt {
             match vk {
@@ -1836,16 +2491,6 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
             }
         }
         return !alt;
-    }
-    // Ctrl+Shift+S: save the session under a name typed at the bottom of the window.
-    if ctrl && shift && !alt && vk == 'S' as u16 && with(|a| a.rename.is_none()) {
-        drop_char(hwnd);
-        with(|a| {
-            a.prompt = Some(String::new());
-            a.toast = None;
-        });
-        let _ = InvalidateRect(Some(hwnd), None, false);
-        return true;
     }
     // While a name is typed, keys edit it and never reach the shell; Alt chords stay with the system.
     if with(|a| a.rename.is_some()) {
@@ -1900,11 +2545,11 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
         let _ = InvalidateRect(Some(hwnd), None, false);
         return true;
     }
-    // Shift+arrows select text instead of reaching the shell.
-    if let (Some(d), true, false, false) = (dir, shift, alt, ctrl) {
+    // Shift+arrows select text instead of reaching the shell; with Ctrl, Left / Right go by words.
+    if let (Some(d), true, false) = (dir, shift, alt) {
         with(|a| {
             if let Some(p) = a.panes.get_mut(a.focus) {
-                p.extend_selection(d);
+                p.extend_selection(d, ctrl);
             }
         });
         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1946,30 +2591,16 @@ unsafe fn on_key(hwnd: HWND, vk: u16) -> bool {
             _ => None,
         };
         if split.is_some() {
-            with(|a| a.skip_char = true);
+            drop_char(hwnd);
             leave_zoom(hwnd);
             add_pane(hwnd, split);
             return true;
         }
     }
-    // dterm shortcuts; their Ctrl+letter WM_CHAR must not reach the shell.
-    if ctrl && !alt && (vk == 'V' as u16 || (shift && "TWRZG".contains(vk as u8 as char))) {
-        with(|a| a.skip_char = true);
-        if vk == 'V' as u16 {
-            paste(hwnd);
-        } else if vk == 'T' as u16 {
-            leave_zoom(hwnd);
-            add_pane(hwnd, None);
-        } else if vk == 'R' as u16 {
-            begin_rename(hwnd);
-        } else if vk == 'Z' as u16 {
-            toggle_view(hwnd, View::Zoom);
-        } else if vk == 'G' as u16 {
-            toggle_view(hwnd, View::Tabs);
-        } else if let Some(id) = with(|a| a.panes.get(a.focus).map(|p| p.id)) {
-            leave_zoom(hwnd);
-            remove_pane(hwnd, id);
-        }
+    // Ctrl+V and Ctrl+Shift+V paste; their ^V must not reach the shell.
+    if ctrl && !alt && vk == 'V' as u16 {
+        drop_char(hwnd);
+        paste(hwnd);
         return true;
     }
     // Ctrl+Plus / Minus / 0 change the font size. Whatever character they make (Ctrl+Minus gives 0x1F)
@@ -2125,6 +2756,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = InvalidateRect(Some(hwnd), None, false);
             return LRESULT(0);
         }
+        // The settings page takes no mouse input, and none reaches the panes behind it.
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MOUSEWHEEL if with(|a| a.page.is_some()) => return LRESULT(0),
         // The landing page: hovering selects a choice, a click opens it.
         WM_MOUSEMOVE | WM_LBUTTONDOWN if with(|a| a.landing.is_some()) => {
             let m = mouse(hwnd);
@@ -2133,18 +2766,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if msg == WM_LBUTTONDOWN {
                     open_choice(hwnd, i);
                 } else if with(|a| a.landing.as_mut().is_some_and(|l| std::mem::replace(&mut l.sel, i) != i)) {
-                    with(|a| a.landing.as_mut().map(|l| l.armed = false));
+                    with(|a| a.landing.as_mut().map(|l| (l.armed, l.leaving) = (false, false)));
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
             return LRESULT(0);
         }
-        WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT && with(|a| a.landing.is_some()) => {
+        WM_RBUTTONDOWN | WM_MOUSEWHEEL if with(|a| a.landing.is_some()) => return LRESULT(0),
+        WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT && with(|a| a.landing.is_some() || a.page.is_some()) => {
             let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
             return LRESULT(1);
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if on_key(hwnd, wp.0 as u16) {
+            if on_key(hwnd, wp.0 as u16, (lp.0 as u32 >> 16) & 0xFF) {
                 return LRESULT(0);
             }
         }
@@ -2181,6 +2815,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         }
                     }),
                     Hit::Button => toggle_view(hwnd, View::Tabs),
+                    Hit::Home => go_home(hwnd),
                 }
                 let _ = InvalidateRect(Some(hwnd), None, false);
             } else if let Some((path, _)) = divider_at(hwnd) {
@@ -2343,6 +2978,8 @@ fn main() {
         let label = label_format(&dw, LABEL_SIZE, DWRITE_TEXT_ALIGNMENT_TRAILING).expect("font");
         let tab = label_format(&dw, TAB_SIZE, DWRITE_TEXT_ALIGNMENT_CENTER).expect("font");
         let cell = cell_size(&dw, &format).expect("font metrics");
+        let settings = data_dir().and_then(|d| std::fs::read_to_string(d.join("settings")).ok()).map_or_else(Settings::default, |t| parse_settings(&t));
+        THEME.store(settings.theme, Ordering::Relaxed);
 
         let hinst = GetModuleHandleW(None).expect("module");
         let wc = WNDCLASSW {
@@ -2360,7 +2997,7 @@ fn main() {
                 select: None, click: (0, f32::MIN, f32::MIN, 0),
                 home: std::env::var("USERPROFILE").ok(), rename: None, title: "dterm".into(),
                 view: View::Grid, mouse: None, tracking: false, landing: None, prompt: None, toast: None,
-                created: now(),
+                created: now(), settings, page: None,
             })
         });
         let hwnd = CreateWindowExW(
@@ -2380,7 +3017,7 @@ fn main() {
         // With a last or saved session, start on the landing page; otherwise straight in a new one.
         let rows = data_dir().map(|d| landing_rows(&d, &ago)).unwrap_or_default();
         if rows.len() > 1 {
-            with(|a| a.landing = Some(Landing { rows, sel: 0, armed: false }));
+            with(|a| a.landing = Some(Landing { rows, sel: 0, armed: false, leaving: false }));
         } else {
             add_pane(hwnd, None);
             if with(|a| a.panes.is_empty()) {
@@ -2524,7 +3161,8 @@ fn check() {
     assert_eq!((hit(tb, 10.0, 10.0), hit(tb, 370.0, 29.0), hit(tb, 539.0, 0.0)), (Some(Hit::Tab(0)), Some(Hit::Tab(2)), Some(Hit::Tab(2))));
     assert_eq!((hit(tb, 541.0, 10.0), hit(tb, 10.0, 30.0), hit(tb, -1.0, 10.0)), (None, None, None));
     assert_eq!((hit(tb, 970.0, 10.0), hit(g, 970.0, 10.0), hit(z, 999.0, 0.0)), (Some(Hit::Button), Some(Hit::Button), Some(Hit::Button)));
-    assert_eq!((hit(g, 969.0, 10.0), hit(g, 10.0, 10.0), hit(g, 970.0, 30.0)), (None, None, None));
+    assert_eq!((hit(g, 969.0, 10.0), hit(tb, 940.0, 0.0), hit(g, 939.0, 10.0)), (Some(Hit::Home), Some(Hit::Home), None));
+    assert_eq!((hit(g, 10.0, 10.0), hit(g, 970.0, 30.0)), (None, None));
     // The grid's button shows only near the top edge.
     let near = |y| hover_state(g, 3, Some((990.0, y)), 1000.0);
     assert_eq!((near(10.0), near(35.0), near(36.0)), ((true, Some(Hit::Button)), (true, None), (false, None)));
@@ -2598,12 +3236,14 @@ fn check() {
         a: Box::new(Node::Leaf(0)),
         b: Box::new(Node::Split { side_by_side: false, ratio: 0.5, a: Box::new(Node::Leaf(1)), b: Box::new(Node::Leaf(2)) }),
     };
-    let panes = vec![("C:\\a b".into(), "build".into()), (String::new(), String::new()), ("D:\\x".into(), String::new())];
+    let pane = |cwd: &str, name: &str, run: &str| SavedPane { cwd: cwd.into(), name: name.into(), run: run.into() };
+    let panes = vec![pane("C:\\a b", "build", ""), pane("", "", "claude --resume 0a1b-2c"), pane("D:\\x", "", "")];
     let s = Session { view: View::Tabs, font: 18.0, focus: 2, tree, panes, created: 1_700_000_000, closed: 1_700_003_600 };
     let text = session_text(&s);
     assert!(text.starts_with(
         "dterm-session 1\nview tabs\nfont 18\nfocus 2\ncreated 1700000000\nclosed 1700003600\nsplit side 0.250\npane C:\\a b\tbuild\n"
     ));
+    assert!(text.contains("pane \t\tclaude --resume 0a1b-2c\n")); // the command only when there is one
     assert_eq!(parse_session(&text), Some(s));
     assert!(parse_session(&text.replace("\n", "\r\n")).is_some()); // Notepad line breaks
     // Leaves get renumbered in tree order, whatever their ids were.
@@ -2616,7 +3256,7 @@ fn check() {
         assert!(parse_session(bad).is_none(), "{bad:?}");
     }
     let one = parse_session(&format!("{head}pane \t\n")).unwrap();
-    assert_eq!((one.tree, one.panes), (Node::Leaf(0), vec![(String::new(), String::new())]));
+    assert_eq!((one.tree, one.panes), (Node::Leaf(0), vec![SavedPane::default()]));
     assert_eq!(parse_session("dterm-session 1\nview grid\nfont 99\nfocus 9\npane a\t\n").map(|s| (s.font, s.focus)), Some((40.0, 0)));
     // Saved-session file names keep letters, digits, space, - and _.
     assert_eq!(session_file_name("  my: work/agents?  "), Some("my workagents".into()));
@@ -2640,10 +3280,13 @@ fn check() {
     assert_eq!(ago(0), "");
     // Preview names: the typed name, else the folder, "~" for home or unknown.
     let home = Some("C:\\Users\\x");
-    assert_eq!(preview_name(&("C:\\Users\\x\\dterm".into(), String::new()), home), "dterm");
-    assert_eq!(preview_name(&("C:\\Users\\X\\".into(), String::new()), home), "~");
-    assert_eq!(preview_name(&(String::new(), String::new()), home), "~");
-    assert_eq!(preview_name(&("C:\\a".into(), "build".into()), home), "build");
+    assert_eq!(preview_name(&pane("C:\\Users\\x\\dterm", "", ""), home), "dterm");
+    assert_eq!(preview_name(&pane("C:\\Users\\X\\", "", ""), home), "~");
+    assert_eq!(preview_name(&SavedPane::default(), home), "~");
+    assert_eq!(preview_name(&pane("C:\\a", "build", ""), home), "build");
+    assert_eq!(preview_caption(true, "", ""), "a fresh shell in your home folder");
+    assert_eq!(preview_caption(false, "", ""), ""); // old file without times
+    assert_eq!(preview_caption(false, "today 09:00", "today 10:00"), "started today 09:00  \u{b7}  closed today 10:00");
     // The console's first title (the shell's path) is not an app name.
     let mut n = Names::default();
     n.set_title(Some("C:\\Program Files\\Git\\bin\\bash.exe"));
@@ -2651,4 +3294,60 @@ fn check() {
     n.set_title(Some("Claude Code"));
     assert_eq!(n.app.as_deref(), Some("Claude Code"));
     assert_eq!(pane_count(1), "1 pane");
+    // Only commands dterm saves itself are run from a session file.
+    assert!(resume_command("claude") && resume_command("claude --resume 3f2a-9c"));
+    assert!(!resume_command("claude --resume ") && !resume_command("claude --resume x; rm -rf ~") && !resume_command("vim"));
+    // Shortcuts: names, parsing, the keypad's + and -, and Ctrl or Alt required.
+    let ca = |vk| Chord { vk, ctrl: true, alt: true, shift: false };
+    assert_eq!(parse_chord("Ctrl+Alt+T"), Some(ca(0x54)));
+    assert_eq!(parse_chord(" ctrl+alt+plus "), Some(ca(0xBB)));
+    assert_eq!(parse_chord("Alt+Shift+F5"), Some(Chord { vk: 0x74, ctrl: false, alt: true, shift: true }));
+    assert_eq!((parse_chord("Shift+T"), parse_chord("T"), parse_chord("Ctrl+Up"), parse_chord("Meta+T")), (None, None, None, None));
+    assert_eq!((chord_text(ca(0xBC)), chord_text(ca(0x37))), ("Ctrl+Alt+Comma".into(), "Ctrl+Alt+7".into()));
+    assert_eq!((chord_of(0x6B, false, true, true), chord_of(0x6D, false, true, true)), (ca(0xBB), ca(0xBD)));
+    for a in ACTIONS {
+        assert_eq!(parse_chord(a.3).map(chord_text).as_deref(), Some(a.3)); // every default reads back
+    }
+    // Settings: defaults, binding moves keys, the file round trip, bad lines keep defaults.
+    let mut st = Settings::default();
+    assert_eq!(st.action(ca(0x54)), Some(Action::NewPane));
+    assert_eq!(st.action(ca(0xBD)), Some(Action::SplitDown));
+    assert_eq!(st.action(Chord { vk: 0x54, ctrl: true, alt: false, shift: true }), None); // Ctrl+Shift+T is the shell's now
+    st.bind(Action::Zoom as usize, Some(ca(0x54)));
+    assert_eq!((st.action(ca(0x54)), st.keys[Action::NewPane as usize]), (Some(Action::Zoom), None));
+    st.theme = 2;
+    st.opacity = 0.85;
+    assert_eq!(parse_settings(&settings_text(&st)), st);
+    assert!(settings_text(&st).contains("key new-pane none\n"));
+    let odd = parse_settings("\u{feff}theme nope\nopacity 5\nkey zoom Shift+Q\nkey nope Ctrl+Alt+Q\njunk\n");
+    assert_eq!((odd.theme, odd.opacity, odd.keys[Action::Zoom as usize]), (0, MIN_OPACITY, None));
+    assert_eq!(parse_settings(""), Settings::default());
+    // Word steps over "ab  cd" (cells 0..6): right to the end of a word, left to its start.
+    let words = |i: i64| !matches!(i, 2 | 3);
+    assert_eq!((word_move(0, true, 6, words), word_move(2, true, 6, words), word_move(6, true, 6, words)), (2, 6, 6));
+    assert_eq!((word_move(6, false, 6, words), word_move(4, false, 6, words), word_move(1, false, 6, words)), (4, 0, 0));
+    // Processes: Claude Code under Git Bash's launcher and its bash; loops from reused pids end.
+    let procs = [(10, 1, "bash.exe".into()), (11, 10, "bash.exe".into()), (12, 11, "claude.exe".into()), (20, 1, "Claude.exe".into())];
+    assert_eq!((descendant(&procs, 10, "claude.exe"), descendant(&procs, 11, "CLAUDE.EXE"), descendant(&procs, 12, "claude.exe")), (Some(12), Some(12), None));
+    assert_eq!(descendant(&[(5, 6, "a".into()), (6, 5, "b".into())], 5, "c"), None);
+    let dir = claude_project("N:\\Davide Chincoli\\12_CODING\\dterm").unwrap();
+    assert_eq!(dir.file_name().unwrap(), "N--Davide-Chincoli-12-CODING-dterm");
+}
+
+#[test]
+#[ignore] // starts Git Bash: cargo test -- --ignored
+fn typeahead_reaches_bash() {
+    let bash = unsafe { git_bash() };
+    let p = spawn(HWND(std::ptr::null_mut()), 0, &bash, (8.0, 16.0), 1.0, None).expect("bash");
+    p.send(b"echo dterm_ok_$((40+2))\r".to_vec());
+    let found = (0..100).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let t = p.term.lock();
+        (0..t.screen_lines() as i32).any(|l| {
+            let row = &t.grid()[Line(l)];
+            (0..t.columns()).map(|c| row[Column(c)].c).collect::<String>().contains("dterm_ok_42")
+        })
+    });
+    let _ = p.tx.send(Msg::Shutdown);
+    assert!(found, "the typed-ahead command never ran");
 }

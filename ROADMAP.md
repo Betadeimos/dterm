@@ -4,6 +4,35 @@ Goal: be a better daily terminal than Windows Terminal for people who run severa
 (and coding agents like Claude Code) side by side. Small native exe, zero config, looks like
 Windows Terminal, but built around the grid.
 
+## Feedback round 3 (done in v0.2.0)
+
+- [x] **Ctrl+Shift+S did nothing** on the user's machine (it worked in automated tests). Every
+  dterm shortcut moved to Ctrl+Alt, so it is now Ctrl+Alt+S. If that fails too, add a key log
+  (WM_KEYDOWN vk + modifiers) to see what arrives; keyboard layout or a global keyboard hook are
+  the suspects.
+- [x] **Restored sessions lost running programs.** Saving now finds `claude.exe` under each pane's
+  shell (process tree), picks that folder's newest conversation in `~/.claude/projects/<folder>`
+  written since Claude started, and saves `claude --resume <id>` (or `claude` with no
+  conversation yet). Restoring types it into the new shell. Only those two command shapes are
+  ever run from a session file. Limits: two Claude panes in one folder may swap conversations;
+  other programs (vim, dev servers) don't come back yet.
+- [x] **Shortcuts on Ctrl+Alt:** Ctrl+Alt+T, Plus, Minus, W, R, S, Z, G, H, Comma. Alt+Shift+Plus /
+  Minus stay as in Windows Terminal; Ctrl+Shift+C / V stay for copy and paste. AltGr+key types
+  its character when the layout has one (checked with ToUnicode while right Alt is down); left
+  Ctrl + left Alt always give the shortcut.
+- [x] **Ctrl+Shift+Left/Right select by word** (blanks and alacritty's double-click stop
+  characters end a word); Ctrl+Shift+Up/Down act like Shift+Up/Down.
+- [x] **Back to the landing page:** Ctrl+Alt+H and a ≡ button next to the grid/tabs button. The
+  session keeps running as the first choice ("This session", Esc goes back); opening another one
+  asks once, then saves and closes it.
+- [x] **Settings page** (Ctrl+Alt+Comma, keyboard only): theme (One Half Dark, Campbell, Catppuccin
+  Mocha, Dracula), opacity, and every shortcut (Enter, press keys; Del = default; keys already
+  used move over). Saved to `%APPDATA%\dterm\settings`.
+- [x] **Versions and releases:** 0.2.0, shown on the landing page. `release.ps1` builds
+  `dist\dterm-vX.Y.Z.exe` and `.zip`; `-Publish` tags and runs `gh release create`.
+- [ ] Later: a GitHub Actions workflow that builds the release on tag push; mouse support on the
+  settings page; font family and size in settings.
+
 ## Requested features
 
 Ordered roughly by how much they hurt today.
@@ -26,8 +55,8 @@ Windows Terminal defaults in brackets, so muscle memory carries over.
 - [x] **Zoom** the focused pane to fill the window, and back to the grid [WT: togglePaneZoom, unbound].
 - [x] **Grid ⇄ tabs toggle.** One shortcut (and one small button) switches the same sessions
       between the grid and tab view. WT can't do this: panes and tabs are separate there.
-- [x] Ctrl+Shift+W closes the focused pane [WT: same].
-- [x] Keep Ctrl+Shift+T (add pane, auto grid) and Alt+arrows (move focus, done).
+- [x] Ctrl+Alt+W closes the focused pane [WT: Ctrl+Shift+W].
+- [x] Keep an add-pane shortcut (now Ctrl+Alt+T, auto grid) and Alt+arrows (move focus, done).
 
 ### Knowing which pane is which
 - [x] **Focus indicator:** a very faint border on the focused pane and slightly dimmer unfocused
@@ -72,7 +101,7 @@ WT does **not** have:
    Signals: output activity, the bell, OSC 9/777 notifications, OSC 133 prompt marks.
 3. **Sessions that come back** with names and folders, from a quick landing page.
 4. **Broadcast input:** type once into all panes (or a chosen set).
-5. **Stays tiny:** one native exe (~320 KB today), instant start, no Electron, no settings file needed.
+5. **Stays tiny:** one native exe (~470 KB today), instant start, no Electron, no settings file needed.
 
 ## Other open-source grid terminals
 
