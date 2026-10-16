@@ -4,6 +4,8 @@
 
 <p align="center">A tiny Windows terminal that puts your shells in a grid.</p>
 
+![dterm with four panes: git log, color test, cargo test and an agent session](assets/screenshot.png)
+
 One native exe (about 320 KB), nothing to configure. Panes run Git Bash, start in your home
 folder, and look like Windows Terminal: acrylic background, One Half Dark colors, Cascadia Mono,
 font fallback for symbols and emoji.
