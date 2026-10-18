@@ -15,7 +15,7 @@ One exe under 500 KB. No Electron. No config.</p>
 - **Grid or Tabs, same sessions.** `Ctrl+Alt+G` flips between them without touching a shell.
 - **Claude Code comes back.** Close dterm, reopen it: every pane returns to its folder, and panes that
   ran [Claude Code](https://claude.com/claude-code) resume their newest conversation (`claude --resume <id>`).
-- **See which pane needs you.** Background panes tint blue while busy, green when done, yellow on a bell.
+- **See which pane needs you.** A small dot before a pane's name (and its tab) is blue while it streams output, green once it has been quiet for 4.5 s, yellow after a bell. Focusing the pane clears it.
 - **Looks like Windows Terminal.** Acrylic that stays on when unfocused, One Half Dark, Cascadia Mono,
   emoji and symbol fallback, 4 themes.
 
@@ -98,7 +98,7 @@ Settings live in `%APPDATA%\dterm\settings`, a small text file you can also edit
 
 ## Status and roadmap
 
-Early, but in daily use. See [ROADMAP.md](ROADMAP.md): easier-to-see pane status, broadcast input, mouse
+Early, but in daily use. See [ROADMAP.md](ROADMAP.md): more status signals (OSC 9/777, OSC 133), broadcast input, mouse
 reporting for vim and tmux.
 
 ## License

@@ -4,19 +4,28 @@ Goal: be a better daily terminal than Windows Terminal for people who run severa
 (and coding agents like Claude Code) side by side. Small native exe, zero config, looks like
 Windows Terminal, but built around the grid.
 
+## Feedback round 5 (done in v0.2.2)
+
+- [x] **Status you can see, without noise:** a solid 8 DIP dot before a pane's name (and before
+  its tab name): blue while output streams, green once it has been quiet for 4.5 s (so thinking
+  pauses don't flash Done), yellow after a bell. The name stays its normal grey and there is no
+  status border: borders only mark the focused pane. The focused pane of an inactive window counts
+  as a background pane; its status stays after you come back until you click or type.
+- [x] **Fixed window title:** `dterm — <session name>`, or `dterm — untitled`; it no longer
+  follows the focused pane.
+- [ ] More status signals: OSC 9/777 notifications and OSC 133 prompt marks.
+
 ## Feedback round 4 (done in v0.2.1)
 
-- [x] **Agent status per pane:** the name of a background pane is tinted blue while it streams
-  output, green once it goes quiet, yellow after a bell; focusing clears it (also on tab names).
-  Shared atomics from the PTY thread, a timer only while a pane is busy, no new crates.
+- [x] **Agent status per pane:** the name of a background pane was tinted blue while it streamed
+  output, green once it went quiet, yellow after a bell (replaced by the dot in v0.2.2); focusing
+  clears it (also on tab names). Shared atomics from the PTY thread, a timer only while a pane is
+  busy, no new crates.
 - [x] **A session stays the same session:** opening a saved one keeps it open under its name (the
   landing page used to show it as a new "This session"); Ctrl+Alt+S saves over its file, or asks
   for a name the first time; F2 on the running session saves it as a new session and leaves the
   old one as it was.
-- [ ] **Status colours are hard to see:** the tint is too faint on the label. Make it easier to
-  notice (stronger colour, a dot or a border cue) without turning it loud. Also: OSC 9/777
-  notifications and OSC 133 prompt marks as signals, and count the focused pane of an inactive
-  window as a background pane.
+- [x] **Status colours are hard to see:** fixed in v0.2.2 with the dot, see round 5.
 
 ## Feedback round 3 (done in v0.2.0)
 
@@ -82,6 +91,7 @@ Windows Terminal defaults in brackets, so muscle memory carries over.
       Fades while you type in that pane. No title bars, no chrome.
 - [x] **Agent status per pane:** the name of a background pane is tinted blue while it streams
       output, green once it goes quiet, yellow after a bell. Focusing the pane clears it.
+      (Since v0.2.2 shown as a dot, not a tint.)
 
 ### Sessions
 - [x] **Session restore + landing page.** On start, a terminal-style menu (like opencode):

@@ -170,10 +170,10 @@ const FOOT_H: f32 = 30.0; // DIPs, the landing page's footer bar
 const PROMPT_MAX: usize = 40; // characters of a typed session name
 const TOAST_TIMER: usize = 1; // hides the "saved" note
 const STATUS_TIMER: usize = 2; // runs while a pane is busy, to notice when it goes quiet
-const BUSY_MS: u64 = 1500; // output within this long ago counts as busy
+const BUSY_MS: u64 = 4500; // output within this long ago counts as busy; a thinking pause is shorter
 const STATUS_TICK: u32 = 400; // ms between checks while a pane is busy
-const STATUS_ALPHA: f32 = 0.75; // tinted name of a background pane that is done or wants you
-const BUSY_ALPHA: f32 = 0.55; // ... and of one that is busy
+const DOT_R: f32 = 4.0; // DIPs, radius of the status dot before a name (8 across)
+const DOT_GAP: f32 = 14.0; // DIPs the name moves right to make room for the dot
 
 fn rgb(c: u32) -> Rgb {
     Rgb { r: (c >> 16) as u8, g: (c >> 8) as u8, b: c as u8 }
@@ -1267,8 +1267,8 @@ fn pick_name(custom: Option<&str>, n: &Names, home: Option<&str>) -> Option<Stri
 }
 
 /// Window title for the focused pane's name.
-fn window_title(name: Option<&str>) -> String {
-    name.map_or("dterm".into(), |n| format!("dterm \u{2014} {n}"))
+fn window_title(session: Option<&str>) -> String {
+    format!("dterm \u{2014} {}", session.unwrap_or("untitled"))
 }
 
 /// What a pane that is not focused has been up to. Focusing it clears the state.
@@ -1304,15 +1304,24 @@ fn next_status(now: Status, focused: bool, bell: bool, quiet: Option<u64>) -> St
     }
 }
 
-/// The color that tints a pane's name for a status: blue busy, green done, yellow waiting.
-fn status_tint(s: Status) -> Option<(Rgb, f32)> {
+/// The color of a status dot: blue busy, green done, yellow waiting.
+/// The bright ANSI colors, which stand out on every theme's background.
+fn status_color(s: Status) -> Option<Rgb> {
     let t = &theme().ansi;
     match s {
         Status::Idle => None,
-        Status::Busy => Some((rgb(t[4]), BUSY_ALPHA)),
-        Status::Done => Some((rgb(t[2]), STATUS_ALPHA)),
-        Status::Attention => Some((rgb(t[3]), STATUS_ALPHA)),
+        Status::Busy => Some(rgb(t[12])),
+        Status::Done => Some(rgb(t[10])),
+        Status::Attention => Some(rgb(t[11])),
     }
+}
+
+/// A solid dot of `c` centered at `(cx, cy)`; smooth, though the rest is drawn aliased.
+unsafe fn draw_dot(rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, (cx, cy): (f32, f32), c: Rgb) {
+    brush.SetColor(&color(c, 1.0));
+    rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    rt.FillEllipse(&D2D1_ELLIPSE { point: windows_numerics::Vector2 { X: cx, Y: cy }, radiusX: DOT_R, radiusY: DOT_R }, brush);
+    rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
 }
 
 /// Forwards terminal events from a pane's PTY thread to the window.
@@ -1494,6 +1503,7 @@ struct App {
     file: Option<std::path::PathBuf>, // the saved session this window is; Save writes over it
     settings: Settings,
     page: Option<SettingsPage>,  // the settings page, shown over the panes or the landing page
+    seen: bool,                  // the user has clicked or typed since the window was last deactivated; until then the focused pane counts as background
 }
 
 /// The settings page: the selected row (theme, opacity, then one per action) and whether it waits
@@ -1519,10 +1529,12 @@ impl App {
         self.view == View::Grid || i == self.focus
     }
 
-    /// Updates every pane's status; true if any changed. Focusing a pane clears its status.
+    /// Updates every pane's status; true if any changed. Focusing a pane clears its status,
+    /// but only once the user has clicked or typed: after an Alt-Tab the focused pane is background too,
+    /// and coming back does not clear it.
     fn refresh_status(&mut self) -> bool {
-        let (now, focus) = (uptime(), self.focus);
-        self.panes.iter_mut().enumerate().fold(false, |c, (i, p)| p.refresh_status(i == focus, now) | c)
+        let (now, focus, seen) = (uptime(), self.focus, self.seen);
+        self.panes.iter_mut().enumerate().fold(false, |c, (i, p)| p.refresh_status(i == focus && seen, now) | c)
     }
 
     /// Pane ids in tree order, which is also the tab order.
@@ -2071,10 +2083,14 @@ unsafe fn paint(hwnd: HWND) {
                     Some((_, typed)) => (format!("{typed}\u{258f}"), 1.0), // the name being typed, with a caret
                     None => (p.name(a.home.as_deref()).unwrap_or_default(), if focused { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }),
                 };
-                let (tint, alpha) = status_tint(p.status).filter(|_| a.rename.is_none()).unwrap_or((fg(), alpha));
-                brush.SetColor(&color(tint, alpha));
+                let mut dx = 0.0;
+                if let Some(c) = status_color(p.status).filter(|_| a.rename.is_none()) {
+                    draw_dot(rt, brush, (x + PAD + DOT_R, y + LABEL_TOP / 2.0), c);
+                    dx = DOT_GAP;
+                }
+                brush.SetColor(&color(fg(), alpha));
                 let units: Vec<u16> = text.encode_utf16().collect();
-                let slot = rect(x + PAD, y, pw - 2.0 * PAD, LABEL_TOP);
+                let slot = rect(x + PAD + dx, y, (pw - 2.0 * PAD - dx).max(0.0), LABEL_TOP);
                 rt.DrawText(&units, &a.label, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
             }
             rt.PopAxisAlignedClip();
@@ -2305,10 +2321,14 @@ unsafe fn draw_chrome(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCol
                 }
             };
             let (x, room) = (n as f32 * tw + TAB_PAD, (tw - 2.0 * TAB_PAD).max(0.0));
-            let (tint, alpha) = status_tint(p.status).filter(|_| a.rename.is_none()).unwrap_or((fg(), alpha));
-            brush.SetColor(&color(tint, alpha));
+            let mut dx = 0.0;
+            if let Some(c) = status_color(p.status).filter(|_| a.rename.is_none()) {
+                draw_dot(rt, brush, (x + DOT_R, TAB_H / 2.0), c);
+                dx = DOT_GAP;
+            }
+            brush.SetColor(&color(fg(), alpha));
             let units: Vec<u16> = text.encode_utf16().collect();
-            rt.DrawText(&units, &a.tab, &rect(x, 0.0, room, TAB_H), brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            rt.DrawText(&units, &a.tab, &rect(x + dx, 0.0, (room - dx).max(0.0), TAB_H), brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
             if active {
                 brush.SetColor(&color(fg(), UNDERLINE_ALPHA));
                 rt.FillRectangle(&rect(x, TAB_H - 2.0, room, 2.0), brush);
@@ -2893,10 +2913,10 @@ unsafe fn leave_zoom(hwnd: HWND) -> bool {
     view != View::Tabs
 }
 
-/// Window title: the focused pane's name.
+/// Window title: dterm and the session's name, or "untitled"; it does not change with the focused pane.
 unsafe fn update_title(hwnd: HWND) {
     let title = with(|a| {
-        let t = window_title(a.panes.get(a.focus).and_then(|p| p.name(a.home.as_deref())).as_deref());
+        let t = window_title(a.file.as_deref().map(stem).as_deref());
         (t != a.title).then(|| {
             a.title = t.clone();
             t
@@ -3280,6 +3300,9 @@ unsafe fn sync_status(hwnd: HWND) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_KEYDOWN | WM_SYSKEYDOWN | WM_CHAR) {
+        with(|a| a.seen = true);
+    }
     match msg {
         WM_WAKE => {
             sync_status(hwnd);
@@ -3300,6 +3323,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         WM_ERASEBKGND => return LRESULT(1),
+        // While another window is active, the focused pane shows its status like a background one,
+        // and it stays that way after coming back until a click or key.
+        WM_ACTIVATE => {
+            if (wp.0 & 0xffff) == 0 {
+                with(|a| a.seen = false);
+            }
+            sync_status(hwnd);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
         // Always draw the frame as active: Windows otherwise swaps the acrylic for a flat color
         // whenever another window has the focus.
         WM_NCACTIVATE => return DefWindowProcW(hwnd, msg, WPARAM(1), lp),
@@ -3629,7 +3661,7 @@ fn main() {
                 select: None, click: (0, f32::MIN, f32::MIN, 0),
                 home: std::env::var("USERPROFILE").ok(), rename: None, title: "dterm".into(),
                 view: View::Grid, mouse: None, tracking: false, landing: None, prompt: None, toast: None,
-                created: now(), file: None, settings, page: None,
+                created: now(), file: None, settings, page: None, seen: true,
             })
         });
         let hwnd = CreateWindowExW(
@@ -3740,7 +3772,7 @@ fn check() {
     n.set_title(None);
     n.set_title(Some("  "));
     assert_eq!((n.app.as_deref(), pick_name(None, &n, home).as_deref()), (None, Some("~")));
-    assert_eq!((window_title(None).as_str(), window_title(Some("proj")).as_str()), ("dterm", "dterm \u{2014} proj"));
+    assert_eq!((window_title(None).as_str(), window_title(Some("proj")).as_str()), ("dterm \u{2014} untitled", "dterm \u{2014} proj"));
     // Split tree in a 1000 x 600 window: pane 0 | (pane 1 over pane 2).
     let win = (0.0, 0.0, 1000.0, 600.0);
     let mk = || {
