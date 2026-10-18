@@ -22,7 +22,7 @@ Windows Terminal, but built around the grid.
   Ctrl + left Alt always give the shortcut.
 - [x] **Ctrl+Shift+Left/Right select by word** (blanks and alacritty's double-click stop
   characters end a word); Ctrl+Shift+Up/Down act like Shift+Up/Down.
-- [x] **Back to the landing page:** Ctrl+Alt+H and a ≡ button next to the grid/tabs button. The
+- [x] **Back to the landing page:** Ctrl+Alt+H and a ≡ button in the title bar, top-left, next to the grid/tabs button (min / max / close sit top-right). The
   session keeps running as the first choice ("This session", Esc goes back); opening another one
   asks once, then saves and closes it.
 - [x] **Settings page** (Ctrl+Alt+Comma, keyboard only): theme (One Half Dark, Campbell, Catppuccin
@@ -31,7 +31,7 @@ Windows Terminal, but built around the grid.
 - [x] **Versions and releases:** 0.2.0, shown on the landing page. `release.ps1` builds
   `dist\dterm-vX.Y.Z.exe` and `.zip`; `-Publish` tags and runs `gh release create`.
 - [ ] Later: a GitHub Actions workflow that builds the release on tag push; mouse support on the
-  settings page; font family and size in settings.
+  settings page (the landing page and tabs already take the mouse); font family and size in settings.
 
 ## Requested features
 
@@ -43,7 +43,9 @@ Ordered roughly by how much they hurt today.
       an escape sequence). Shift+Up/Down extends by line. Like Windows Terminal's mark mode.
 - [x] **Right-click:** copies when there is a selection, pastes when there is none (Windows Terminal behavior).
 - [x] **Ctrl+C copies** when there is a selection, otherwise sends interrupt as today.
-- [x] **Mouse-wheel scrollback** through history.
+- [x] **Mouse-wheel scrollback** through history. The wheel goes to apps that enable mouse reporting
+      or alternate scroll; clicks and drags are not reported to apps yet.
+- [ ] Report clicks / drags to apps that ask for the mouse (vim, tmux, htop).
 
 ### Layout and shortcuts
 Windows Terminal defaults in brackets, so muscle memory carries over.
@@ -78,6 +80,13 @@ Windows Terminal defaults in brackets, so muscle memory carries over.
 - [x] **Ctrl+Plus / Ctrl+Minus / Ctrl+0 change the font size** [WT: same].
 - [x] Cosmetic: highlighted text (inverse/background colours) shows thin dark lines between rows.
       Snap cell rectangles to whole pixels so backgrounds join seamlessly like in WT.
+- [x] **Acrylic on Windows 10** (no system backdrops before Windows 11 22H2, where
+      `DWMWA_SYSTEMBACKDROP_TYPE` fails with E_INVALIDARG): the accent policy gives the acrylic. Its blur
+      also filled the invisible resize borders and the caption, so dterm drops the system frame there
+      and draws its own title bar (since then on Windows 11 too, which keeps its own frame on the
+      other three sides for rounded corners and the shadow). Acrylic halves the frame rate while dragging, so moves and resizes
+      use plain blur. Host backdrop brushes render black on Windows 10, and a window region brings
+      back the old basic frame, so neither works.
 
 ## Where Windows Terminal stands (checked October 2026)
 

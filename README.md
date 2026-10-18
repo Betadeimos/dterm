@@ -25,28 +25,30 @@ keyboard), that character wins, and left Ctrl + left Alt give the shortcut.
 | Ctrl+Alt+W *, or `exit` | Close the pane |
 | Ctrl+Alt+R * | Rename the focused pane |
 | Ctrl+Alt+Z * | Zoom the focused pane to the whole window, and back |
-| Ctrl+Alt+G * | Switch between grid and tabs (also the button in the top-right corner) |
+| Ctrl+Alt+G * | Switch between grid and tabs (also the button in the title bar, top-left) |
 | Ctrl+Alt+S * | Save the session under a name |
-| Ctrl+Alt+H * | Go to the start page (also the ≡ button); the session keeps running |
+| Ctrl+Alt+H * | Go to the start page (also the ≡ button, top-left); the session keeps running |
 | Ctrl+Alt+Comma * | Settings |
-| Alt+Arrow keys | Move focus to the pane in that direction |
-| Alt+Shift+Arrow keys | Resize the focused pane |
-| Ctrl+Alt+Arrow keys | Swap the focused pane with its neighbor |
+| Alt+Arrow keys | Move focus to the pane in that direction (in tabs: Left / Right pick the previous / next tab) |
+| Alt+Shift+Arrow keys | Resize the focused pane (grid only) |
+| Ctrl+Alt+Arrow keys | Swap the focused pane with its neighbor (grid only) |
 | Drag a gap between panes | Resize panes |
+| Click a tab | Focus that pane (tabs view) |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous pane or tab |
 | Mouse drag, double / triple click, Shift+Arrow keys | Select text; Ctrl+Shift+Left / Right select by word |
 | Ctrl+C (with a selection), right-click | Copy; right-click without a selection pastes |
 | Ctrl+V / Ctrl+Shift+V | Paste as plain text |
-| Mouse wheel | Scroll back through history |
+| Esc | Drop the selection |
+| Mouse wheel | Scroll back through history; apps that ask for the mouse (or use the alternate screen) get the wheel instead. Clicks and drags are never sent to apps |
 | Ctrl+Plus / Ctrl+Minus / Ctrl+0, Ctrl+wheel | Font size |
 
 ## Sessions
 
-Closing the window saves the session (layout, each pane's folder and name, view, font size) to
-`%APPDATA%\dterm\last.session`; Ctrl+Alt+S saves it under a name in `%APPDATA%\dterm\sessions`.
+Closing the window (X button, Alt+F4, shutdown) or going to the start page saves the session (layout, each pane's folder and name, view, font size) to
+`%APPDATA%\dterm\last.session`; closing the last pane with `exit` ends dterm without saving. Ctrl+Alt+S saves it under a name in `%APPDATA%\dterm\sessions`.
 When something is saved, dterm starts on a small landing page: pick the last session, a saved
 one (with a preview of its layout and when it was started and closed), or a new one.
-Ctrl+Alt+H brings the landing page back while you work: the running session stays first in the
+On the landing page, ↑↓ or the mouse choose, Enter or a click opens, Esc opens the first choice, Del (twice) deletes a saved one. Ctrl+Alt+H brings the landing page back while you work: the running session stays first in the
 list (Esc returns to it), and opening another one closes it after asking once.
 
 Panes that run [Claude Code](https://claude.com/claude-code) come back inside it: dterm saves
@@ -56,7 +58,7 @@ each one's newest conversation and restores it with `claude --resume <id>`.
 
 Ctrl+Alt+Comma opens a page in the same style as the landing page: theme (One Half Dark,
 Campbell, Catppuccin Mocha, Dracula), background opacity, and every dterm shortcut (Enter, then
-press the new keys; Del puts back the default). Changes apply at once and are saved to
+press the new keys; Del puts back the default). Keyboard only, no mouse. Changes apply at once and are saved to
 `%APPDATA%\dterm\settings`, a small text file you can also edit by hand.
 
 ## Install
@@ -66,7 +68,7 @@ and run it. There is no installer: put the exe wherever you like and pin it to t
 
 ## Requirements
 
-- Windows 10 1809 or later (Windows 11 for the acrylic backdrop)
+- Windows 10 1809 or later. Windows 11 22H2+ gets the system acrylic backdrop; on Windows 10 dterm makes the acrylic itself
 - [Git for Windows](https://gitforwindows.org/) (dterm runs its Git Bash)
 
 ## Build

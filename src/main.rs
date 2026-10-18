@@ -5,9 +5,8 @@
 //! Ctrl+Alt+Plus / Ctrl+Alt+Minus (or Alt+Shift+Plus / Minus, as in Windows Terminal) split the
 //! focused one side by side / top and bottom, Ctrl+Alt+W (or `exit`) closes a pane, Ctrl+Alt+R
 //! renames it (Enter confirms, Esc cancels, empty resets), Ctrl+Alt+Z zooms it to the whole window,
-//! Ctrl+Alt+G shows the panes as tabs (also the button in the top-right corner, shown when the mouse
-//! is near the top edge), Ctrl+Alt+S saves the session under a name, Ctrl+Alt+H goes to the start
-//! page (the ≡ button) and Ctrl+Alt+Comma opens the settings (theme, opacity, shortcuts).
+//! Ctrl+Alt+G shows the panes as tabs (also the button in the title bar), Ctrl+Alt+S saves the
+//! session under a name, Ctrl+Alt+H goes to the start page (the ≡ button next to it) and Ctrl+Alt+Comma opens the settings (theme, opacity, shortcuts).
 //! AltGr+key still types its character where the keyboard layout has one.
 //! Fixed keys: Alt+arrows move the focus, Alt+Shift+arrows resize, Ctrl+Alt+arrows swap panes, drag
 //! the gaps to resize, Ctrl+Tab / Ctrl+Shift+Tab go to the next / previous pane. Select with the
@@ -21,7 +20,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
 };
@@ -38,7 +37,7 @@ use alacritty_terminal::{
     vte::ansi::{Color, CursorShape, Rgb},
 };
 use windows::{
-    core::{w, BOOL, PCWSTR},
+    core::{s, w, BOOL, PCWSTR},
     Win32::{
         Foundation::*,
         Graphics::{
@@ -51,7 +50,7 @@ use windows::{
         System::{
             DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData},
             Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS},
-            LibraryLoader::GetModuleHandleW,
+            LibraryLoader::{GetModuleHandleW, GetProcAddress},
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
             Ole::CF_UNICODETEXT,
             Registry::*,
@@ -151,13 +150,15 @@ const FOCUS_ALPHA: f32 = 0.15; // foreground border of the focused pane
 const VEIL_ALPHA: f32 = 0.25; // background veil over unfocused panes
 const LABEL_ALPHA: f32 = 0.4; // pane name; brighter on the focused pane
 const LABEL_FOCUS_ALPHA: f32 = 0.7;
-const TAB_H: f32 = 30.0; // DIPs, height of the tab strip; the view button is this square at its right end
+const TAB_H: f32 = 30.0; // DIPs, height of the tab strip
 const TAB_MAX: f32 = 180.0; // widest tab; they shrink to share the strip when there are many
 const TAB_PAD: f32 = 10.0; // DIPs between a tab's edge and its text
 const TAB_SIZE: f32 = 12.0; // DIPs
 const TAB_ACTIVE_ALPHA: f32 = 0.9; // name of the active tab; inactive ones use LABEL_ALPHA, hovered LABEL_FOCUS_ALPHA
 const UNDERLINE_ALPHA: f32 = 0.6; // underline of the active tab
-const REVEAL: f32 = 36.0; // DIPs from the top edge where the view button shows up in the grid
+const CAPTION_H: f32 = 32.0; // DIPs, the title bar dterm draws itself; everything else is below it
+const CAPTION_BTN: f32 = 46.0; // DIPs, width of its minimize, maximize and close buttons
+const RESIZE_BORDER: f32 = 6.0; // DIPs inside the window edge that resize it on Windows 10
 const LAND_X: f32 = 48.0; // DIPs, where the landing page's text starts
 const LAND_Y: f32 = 56.0;
 const LAND_ROWS: f32 = LAND_Y + 130.0; // first choice, below the logo and tagline
@@ -525,34 +526,50 @@ fn tab_width(n: usize, room: f32) -> f32 {
     (room / n.max(1) as f32).clamp(0.0, TAB_MAX)
 }
 
-/// Part of the window chrome under the mouse.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Hit {
-    Tab(usize),
-    Button, // switches between the grid and the tabs
-    Home,   // goes to the start page
+/// The tab under `m` in Tabs view: `tabs` tabs share the strip from the left of a `width` DIPs wide window.
+fn tab_at(view: View, tabs: usize, (x, y): (f32, f32), width: f32) -> Option<usize> {
+    let tw = tab_width(tabs, width);
+    (view == View::Tabs && (0.0..TAB_H).contains(&y) && tw > 0.0 && (0.0..tw * tabs as f32).contains(&x)).then(|| (x / tw) as usize)
 }
 
-/// What `m` is over: a tab (in Tabs view), the view button (the `TAB_H` square in the top-right
-/// corner of a `width` DIPs wide window) or the start-page button left of it.
-fn chrome_hit(view: View, tabs: usize, (x, y): (f32, f32), width: f32) -> Option<Hit> {
-    if !(0.0..TAB_H).contains(&y) {
-        return None;
+/// What a point `(x, y)` in a `(w, h)` client (pixels) is over when dterm draws its own frame:
+/// the resize edges (`border` thick, 0 when maximized), the caption (`caption` high, minus the
+/// `(left, right)` wide button strips at its ends, which stay client so dterm draws and clicks them), or the client.
+fn frame_hit((x, y): (i32, i32), (w, h): (i32, i32), border: i32, caption: i32, (left, right): (i32, i32)) -> u32 {
+    let (l, r, t, b) = (x < border, x >= w - border, y < border, y >= h - border);
+    match (l, r, t, b) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, ..) => HTLEFT,
+        (_, true, ..) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (.., true) => HTBOTTOM,
+        _ if y < caption && x >= left && x < w - right => HTCAPTION,
+        _ => HTCLIENT,
     }
-    if (width - TAB_H..width).contains(&x) {
-        return Some(Hit::Button);
-    }
-    if (width - 2.0 * TAB_H..width - TAB_H).contains(&x) {
-        return Some(Hit::Home);
-    }
-    let tw = tab_width(tabs, width - 2.0 * TAB_H);
-    (view == View::Tabs && tw > 0.0 && (0.0..tw * tabs as f32).contains(&x)).then(|| Hit::Tab((x / tw) as usize))
 }
 
-/// What the mouse at `m` (`None` = outside the window) means for the chrome: whether it is near
-/// the top edge, which reveals the view button in the grid, and what it is over.
-fn hover_state(view: View, tabs: usize, m: Option<(f32, f32)>, width: f32) -> (bool, Option<Hit>) {
-    m.map_or((false, None), |m| (m.1 < REVEAL, chrome_hit(view, tabs, m, width)))
+/// Which caption button is at `x` in a `width` DIPs wide window: 0 start page and 1 grid / tabs at
+/// the left end (only while a `session` is shown), 2 minimize, 3 maximize and 4 close at the right.
+fn caption_button(x: f32, width: f32, session: bool) -> Option<usize> {
+    let (left, right) = ((x / CAPTION_BTN).floor(), ((x - (width - 3.0 * CAPTION_BTN)) / CAPTION_BTN).floor());
+    if (0.0..3.0).contains(&right) {
+        Some(right as usize + 2)
+    } else {
+        (session && (0.0..2.0).contains(&left)).then(|| left as usize)
+    }
+}
+
+/// Left edge of caption button `i` (see `caption_button`).
+fn caption_x(i: usize, width: f32) -> f32 {
+    if i < 2 { i as f32 * CAPTION_BTN } else { width - (5 - i) as f32 * CAPTION_BTN }
+}
+
+/// Whether panes are shown, so the start page and grid / tabs buttons make sense.
+fn session_shown(a: &App) -> bool {
+    a.landing.is_none() && a.page.is_none()
 }
 
 /// Terminal columns and lines that fit in `(w, h)` DIPs of text area.
@@ -1266,7 +1283,9 @@ struct App {
     format: IDWriteTextFormat,
     bold: IDWriteTextFormat,
     label: IDWriteTextFormat, // pane names
-    tab: IDWriteTextFormat,   // tab names
+    tab: IDWriteTextFormat,   // tab names and the window title
+    cap_hot: Option<usize>,   // caption button under the mouse
+    cap_down: Option<usize>,  // caption button being pressed
     font_size: f32,           // DIPs
     cell: (f32, f32), // DIPs
     target: Option<(ID2D1HwndRenderTarget, ID2D1SolidColorBrush)>,
@@ -1513,18 +1532,18 @@ unsafe fn client_px(hwnd: HWND) -> (u32, u32) {
     (rc.right as u32, rc.bottom as u32)
 }
 
-/// Client size in DIPs.
+/// Client size in DIPs, below the caption.
 unsafe fn client(hwnd: HWND) -> (f32, f32) {
     let (w, h) = client_px(hwnd);
     let s = scale(hwnd);
-    (w as f32 / s, h as f32 / s)
+    (w as f32 / s, h as f32 / s - CAPTION_H)
 }
 
 /// Screen point in client DIPs.
 unsafe fn to_client(hwnd: HWND, mut pt: POINT) -> (f32, f32) {
     let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
     let s = scale(hwnd);
-    (pt.x as f32 / s, pt.y as f32 / s)
+    (pt.x as f32 / s, pt.y as f32 / s - CAPTION_H)
 }
 
 /// Cursor position in client DIPs.
@@ -1632,6 +1651,121 @@ unsafe fn remove_pane(hwnd: HWND, id: usize) {
     }
 }
 
+/// The title bar dterm draws over the top `CAPTION_H` of its client area: the start page and grid /
+/// tabs buttons, the title in the middle, and minimize, maximize (or restore) and close drawn like the system ones.
+unsafe fn draw_caption(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, width: f32, zoomed: bool) {
+    rt.SetTransform(&windows_numerics::Matrix3x2::identity());
+    rt.PushAxisAlignedClip(&rect(0.0, 0.0, width, CAPTION_H), D2D1_ANTIALIAS_MODE_ALIASED);
+    rt.Clear(Some(&color(bg(), a.settings.opacity)));
+    rt.PopAxisAlignedClip();
+    brush.SetColor(&color(fg(), 0.8));
+    let units: Vec<u16> = a.title.encode_utf16().collect();
+    // Centered in the window, clear of the buttons on both sides.
+    let slot = rect(3.0 * CAPTION_BTN, 0.0, (width - 6.0 * CAPTION_BTN).max(0.0), CAPTION_H);
+    rt.DrawText(&units, &a.tab, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+    for i in if session_shown(a) { 0 } else { 2 }..5 {
+        let x = caption_x(i, width);
+        if a.cap_hot == Some(i) {
+            // Close turns red like Windows' own; the others get a light wash.
+            brush.SetColor(&if i == 4 { color(rgb(0xE81123), 1.0) } else { color(fg(), 0.1) });
+            rt.FillRectangle(&rect(x, 0.0, CAPTION_BTN, CAPTION_H), brush);
+        }
+        brush.SetColor(&color(fg(), 0.9));
+        // 10 DIP glyphs on half pixels, so 1 DIP lines stay sharp at 100%.
+        let (cx, cy) = ((x + CAPTION_BTN / 2.0).floor() + 0.5, (CAPTION_H / 2.0).floor() + 0.5);
+        let line = |x0: f32, y0: f32, x1: f32, y1: f32| rt.DrawLine(windows_numerics::Vector2 { X: cx + x0, Y: cy + y0 }, windows_numerics::Vector2 { X: cx + x1, Y: cy + y1 }, brush, 1.0, None);
+        let (bx, by) = ((cx - 0.5).round(), (cy - 0.5).round()); // whole-pixel center for filled glyphs
+        match i {
+            // To the start page: three lines, like the list of sessions there.
+            0 => [0.0, 4.5, 9.0].into_iter().for_each(|dy| rt.FillRectangle(&rect(bx - 6.0, (by - 5.0 + dy).round(), 12.0, 1.5), brush)),
+            // Back to the grid: 2 x 2 tiny squares.
+            1 if a.view == View::Tabs => {
+                for (dx, dy) in [(0.0, 0.0), (6.0, 0.0), (0.0, 6.0), (6.0, 6.0)] {
+                    rt.FillRectangle(&rect(bx - 5.0 + dx, by - 5.0 + dy, 4.0, 4.0), brush);
+                }
+            }
+            // To the tabs: a window outline with a tab on top.
+            1 => {
+                let (x, y) = (bx - 7.0, (by - 5.5).round());
+                rt.FillRectangle(&rect(x, y, 6.0, 3.0), brush);
+                rt.DrawRectangle(&rect(x + 0.5, y + 3.5, 13.0, 7.0), brush, 1.0, None);
+            }
+            2 => line(-5.0, 0.0, 5.0, 0.0),
+            3 if zoomed => {
+                rt.DrawRectangle(&rect(cx - 5.0, cy - 3.0, 8.0, 8.0), brush, 1.0, None);
+                line(-3.0, -5.0, 5.0, -5.0);
+                line(5.0, -5.0, 5.0, 3.0);
+            }
+            3 => rt.DrawRectangle(&rect(cx - 5.0, cy - 5.0, 10.0, 10.0), brush, 1.0, None),
+            _ => {
+                rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                line(-5.0, -5.0, 5.0, 5.0);
+                line(-5.0, 5.0, 5.0, -5.0);
+                rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            }
+        }
+    }
+}
+
+/// The mouse over dterm's own caption buttons: hover, press, and the click when released over the
+/// pressed one. Returns whether the message was theirs.
+unsafe fn caption_mouse(hwnd: HWND, msg: u32) -> bool {
+    let (m, (w, _)) = (mouse(hwnd), client(hwnd));
+    let over = if m.1 < 0.0 { caption_button(m.0, w, with(|a| session_shown(a))) } else { None };
+    let (changed, down) = with(|a| (std::mem::replace(&mut a.cap_hot, over) != over, a.cap_down));
+    if changed {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    match msg {
+        WM_LBUTTONDOWN if over.is_some() => {
+            with(|a| a.cap_down = over);
+            SetCapture(hwnd);
+        }
+        WM_LBUTTONUP if down.is_some() => {
+            with(|a| a.cap_down = None);
+            let _ = ReleaseCapture();
+            let cmd = match over {
+                _ if over != down => return true,
+                Some(0) => return { go_home(hwnd); true },
+                Some(1) => return { toggle_view(hwnd, View::Tabs); true },
+                Some(2) => SC_MINIMIZE,
+                Some(3) if IsZoomed(hwnd).as_bool() => SC_RESTORE,
+                Some(3) => SC_MAXIMIZE,
+                _ => SC_CLOSE,
+            };
+            let _ = PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(cmd as usize), LPARAM(0));
+        }
+        WM_MOUSEMOVE if over.is_some() && !with(|a| std::mem::replace(&mut a.tracking, true)) => {
+            // WM_MOUSELEAVE clears the hover when the mouse moves on to the caption or away.
+            let size = std::mem::size_of::<TRACKMOUSEEVENT>() as u32;
+            let _ = TrackMouseEvent(&mut TRACKMOUSEEVENT { cbSize: size, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 });
+        }
+        _ => {}
+    }
+    over.is_some() || down.is_some()
+}
+
+/// Set on Windows without system backdrops, where the accent policy below gives the acrylic.
+static ACCENT: AtomicBool = AtomicBool::new(false);
+const ACCENT_ACRYLIC: u32 = 4; // ACCENT_ENABLE_ACRYLICBLURBEHIND
+const ACCENT_BLUR: u32 = 3; // ACCENT_ENABLE_BLURBEHIND
+
+/// Sets the undocumented accent policy (WCA_ACCENT_POLICY = 19). Acrylic halves the frame rate
+/// while the window is dragged (30 fps on Windows 10 22H2), so moves and resizes use plain blur.
+unsafe fn set_accent(hwnd: HWND, state: u32) -> bool {
+    #[repr(C)]
+    struct Accent { state: u32, flags: u32, color: u32, anim: u32 }
+    #[repr(C)]
+    struct Data { attrib: u32, data: *mut Accent, size: usize }
+    let Ok(user32) = GetModuleHandleW(w!("user32.dll")) else { return false };
+    let Some(f) = GetProcAddress(user32, s!("SetWindowCompositionAttribute")) else { return false };
+    let f: unsafe extern "system" fn(HWND, *mut Data) -> BOOL = std::mem::transmute(f);
+    // Flags 0x1E0 draw a thin border on all four sides, as there is no system frame (see WM_NCCALCSIZE).
+    // The color (AABBGGRR) is almost clear because we paint the tint; alpha 0 turns the blur off on some builds.
+    let mut accent = Accent { state, flags: 0x1E0, color: 0x0100_0000, anim: 0 };
+    f(hwnd, &mut Data { attrib: 19, data: &mut accent, size: std::mem::size_of::<Accent>() }).as_bool()
+}
+
 unsafe fn paint(hwnd: HWND) {
     let (w, h) = client_px(hwnd);
     let s = scale(hwnd);
@@ -1658,9 +1792,12 @@ unsafe fn paint(hwnd: HWND) {
         }
         let (rt, brush) = a.target.as_ref().unwrap();
         rt.BeginDraw();
+        rt.SetTransform(&windows_numerics::Matrix3x2::translation(0.0, CAPTION_H));
+        let zoomed = IsZoomed(hwnd).as_bool();
         if let Some(page) = &a.page {
             rt.Clear(Some(&color(bg(), a.settings.opacity)));
             draw_settings(a, page, rt, brush);
+            draw_caption(a, rt, brush, w as f32 / s, zoomed);
             if rt.EndDraw(None, None).is_err() {
                 a.target = None;
             }
@@ -1669,6 +1806,7 @@ unsafe fn paint(hwnd: HWND) {
         if let Some(l) = &a.landing {
             rt.Clear(Some(&color(bg(), a.settings.opacity)));
             draw_landing(a, l, rt, brush, w as f32 / s);
+            draw_caption(a, rt, brush, w as f32 / s, zoomed);
             if rt.EndDraw(None, None).is_err() {
                 a.target = None;
             }
@@ -1707,7 +1845,7 @@ unsafe fn paint(hwnd: HWND) {
         // The save-session prompt, or the note after saving: one small line near the bottom.
         let note = a.prompt.as_ref().map(|t| (format!("save session as: {t}\u{258f}"), 0.9)).or(a.toast.clone().map(|t| (t, 0.6)));
         if let Some((text, alpha)) = note {
-            let (cw, ch) = (w as f32 / s, h as f32 / s);
+            let (cw, ch) = (w as f32 / s, h as f32 / s - CAPTION_H);
             let bw = 380f32.min(cw - 16.0);
             let r = rect((cw - bw) / 2.0, ch - 56.0, bw, 30.0);
             brush.SetColor(&color(bg(), 0.95));
@@ -1716,6 +1854,7 @@ unsafe fn paint(hwnd: HWND) {
             let units: Vec<u16> = text.encode_utf16().collect();
             rt.DrawText(&units, &a.tab, &r, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
         }
+        draw_caption(a, rt, brush, w as f32 / s, zoomed);
         if rt.EndDraw(None, None).is_err() {
             a.target = None; // device lost: recreate on the next paint
         }
@@ -1811,22 +1950,24 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
 
 /// The view button, and in Tabs view the strip with a tab per pane, over the panes.
 unsafe fn draw_chrome(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, width: f32) {
-    let tabs = a.view == View::Tabs;
-    let (near, hit) = hover_state(a.view, a.panes.len(), a.mouse, width);
-    if tabs {
+    if a.view != View::Tabs {
+        return;
+    }
+    let hit = a.mouse.and_then(|m| tab_at(a.view, a.panes.len(), m, width));
+    {
         // The strip has the same tint as the panes, so the tabs sit right on the acrylic.
         rt.PushAxisAlignedClip(&rect(0.0, 0.0, width, TAB_H), D2D1_ANTIALIAS_MODE_ALIASED);
         rt.Clear(Some(&color(bg(), a.settings.opacity)));
         rt.PopAxisAlignedClip();
         let order = a.order();
-        let tw = tab_width(order.len(), width - 2.0 * TAB_H);
+        let tw = tab_width(order.len(), width);
         let focused = a.panes.get(a.focus).map(|p| p.id);
         for (n, p) in order.iter().filter_map(|id| a.panes.iter().find(|p| p.id == *id)).enumerate() {
             let active = focused == Some(p.id);
             let (text, alpha) = match a.rename.as_ref().filter(|r| r.0 == p.id) {
                 Some((_, typed)) => (format!("{typed}\u{258f}"), 1.0), // the name being typed, with a caret
                 None => {
-                    let alpha = match (active, hit == Some(Hit::Tab(n))) {
+                    let alpha = match (active, hit == Some(n)) {
                         (true, _) => TAB_ACTIVE_ALPHA,
                         (_, true) => LABEL_FOCUS_ALPHA,
                         _ => LABEL_ALPHA,
@@ -1842,34 +1983,6 @@ unsafe fn draw_chrome(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCol
                 brush.SetColor(&color(fg(), UNDERLINE_ALPHA));
                 rt.FillRectangle(&rect(x, TAB_H - 2.0, room, 2.0), brush);
             }
-        }
-    } else if near {
-        // A backing keeps the buttons legible over a pane's name or first line.
-        brush.SetColor(&color(bg(), 0.9));
-        rt.FillRectangle(&rect(width - 2.0 * TAB_H, 0.0, 2.0 * TAB_H, TAB_H), brush);
-    }
-    if tabs || near {
-        // To the start page: three lines, like the list of sessions there.
-        let hot = hit == Some(Hit::Home);
-        brush.SetColor(&color(fg(), if hot { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }));
-        let (x, y) = ((width - 1.5 * TAB_H - 6.0).round(), (TAB_H / 2.0 - 5.0).round());
-        for dy in [0.0, 4.5, 9.0] {
-            rt.FillRectangle(&rect(x, (y + dy).round(), 12.0, 1.5), brush);
-        }
-        let hot = hit == Some(Hit::Button);
-        brush.SetColor(&color(fg(), if hot { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }));
-        let (cx, cy) = (width - TAB_H / 2.0, TAB_H / 2.0);
-        if tabs {
-            // Back to the grid: 2 x 2 tiny squares.
-            let (x, y) = ((cx - 5.0).round(), (cy - 5.0).round());
-            for (dx, dy) in [(0.0, 0.0), (6.0, 0.0), (0.0, 6.0), (6.0, 6.0)] {
-                rt.FillRectangle(&rect(x + dx, y + dy, 4.0, 4.0), brush);
-            }
-        } else {
-            // To the tabs: a window outline with a tab on top.
-            let (x, y) = ((cx - 7.0).round(), (cy - 5.5).round());
-            rt.FillRectangle(&rect(x, y, 6.0, 3.0), brush);
-            rt.DrawRectangle(&rect(x + 0.5, y + 3.5, 13.0, 7.0), brush, 1.0, None);
         }
     }
 }
@@ -2375,6 +2488,7 @@ unsafe fn update_title(hwnd: HWND) {
     });
     if let Some(t) = title {
         let _ = SetWindowTextW(hwnd, PCWSTR(wide(&t).as_ptr()));
+        let _ = InvalidateRect(Some(hwnd), None, false); // the caption shows it
     }
 }
 
@@ -2702,10 +2816,10 @@ unsafe fn divider_at(hwnd: HWND) -> Option<(Vec<bool>, bool)> {
     with(|a| a.tree.as_ref().filter(|_| a.view == View::Grid)?.divider_at((0.0, 0.0, w, h), m))
 }
 
-/// The window chrome under the mouse, and whether the mouse is over the tab strip.
-unsafe fn chrome_at(hwnd: HWND) -> (Option<Hit>, bool) {
+/// The tab under the mouse, and whether the mouse is over the tab strip.
+unsafe fn chrome_at(hwnd: HWND) -> (Option<usize>, bool) {
     let (m, (w, _)) = (mouse(hwnd), client(hwnd));
-    with(|a| (chrome_hit(a.view, a.panes.len(), m, w), a.view == View::Tabs && m.1 < TAB_H))
+    with(|a| (tab_at(a.view, a.panes.len(), m, w), a.view == View::Tabs && m.1 < TAB_H))
 }
 
 /// Wheel over the pane under `m`: report it to the app, send it arrows, or scroll the scrollback.
@@ -2747,6 +2861,49 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // whenever another window has the focus.
         WM_NCACTIVATE => return DefWindowProcW(hwnd, msg, WPARAM(1), lp),
         WM_SIZE => layout(hwnd),
+        // dterm draws its own caption, so the system one goes. Windows 11 keeps the rest of its
+        // frame (rounded corners, shadow, resize borders), like Windows Terminal. Windows 10 drops
+        // it all: its invisible resize borders would show the acrylic as a halo.
+        WM_NCCALCSIZE if wp.0 != 0 => {
+            let p = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
+            let (zoomed, top) = (IsZoomed(hwnd).as_bool(), p.rgrc[0].top);
+            let dpi = GetDpiForWindow(hwnd);
+            let pad = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+            let (fx, fy) = (GetSystemMetricsForDpi(SM_CXFRAME, dpi) + pad, GetSystemMetricsForDpi(SM_CYFRAME, dpi) + pad);
+            let r = &mut p.rgrc[0];
+            if !ACCENT.load(Ordering::Relaxed) {
+                DefWindowProcW(hwnd, msg, wp, lp);
+                // A maximized window hangs its frame off the screen; keep the content on it.
+                p.rgrc[0].top = if zoomed { top + fy } else { top };
+            } else if zoomed {
+                (r.left, r.top, r.right, r.bottom) = (r.left + fx, r.top + fy, r.right - fx, r.bottom - fy);
+            }
+            return LRESULT(0);
+        }
+        WM_NCHITTEST => {
+            // Windows 11's own side and bottom borders resize as usual; the top edge and the caption are ours.
+            if !ACCENT.load(Ordering::Relaxed) {
+                let hit = DefWindowProcW(hwnd, msg, wp, lp);
+                if hit.0 != HTCLIENT as isize {
+                    return hit;
+                }
+            }
+            let mut pt = POINT { x: lp.0 as u16 as i16 as i32, y: (lp.0 >> 16) as u16 as i16 as i32 };
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+            let ((w, h), s) = (client_px(hwnd), scale(hwnd));
+            let border = if IsZoomed(hwnd).as_bool() { 0 } else { (RESIZE_BORDER * s) as i32 };
+            let left = if with(|a| session_shown(a)) { 2.0 * CAPTION_BTN * s } else { 0.0 };
+            let buttons = (left as i32, (3.0 * CAPTION_BTN * s) as i32);
+            let hit = frame_hit((pt.x, pt.y), (w as i32, h as i32), border, (CAPTION_H * s) as i32, buttons);
+            return LRESULT(hit as isize);
+        }
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP if caption_mouse(hwnd, msg) => return LRESULT(0),
+        WM_ENTERSIZEMOVE if ACCENT.load(Ordering::Relaxed) => _ = set_accent(hwnd, ACCENT_BLUR),
+        WM_EXITSIZEMOVE if ACCENT.load(Ordering::Relaxed) => {
+            // Going straight from blur back to acrylic keeps the blur; switching off in between doesn't.
+            set_accent(hwnd, 0);
+            set_accent(hwnd, ACCENT_ACRYLIC);
+        }
         // Closing the window (not the last pane exiting) remembers the session.
         WM_CLOSE => save_last(),
         WM_ENDSESSION if wp.0 != 0 => save_last(),
@@ -2773,7 +2930,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         WM_RBUTTONDOWN | WM_MOUSEWHEEL if with(|a| a.landing.is_some()) => return LRESULT(0),
-        WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT && with(|a| a.landing.is_some() || a.page.is_some()) => {
+        WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT && (mouse(hwnd).1 < 0.0 || with(|a| a.landing.is_some() || a.page.is_some())) => {
             let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
             return LRESULT(1);
         }
@@ -2806,17 +2963,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(1);
         }
         WM_LBUTTONDOWN => {
-            if let (Some(hit), _) = chrome_at(hwnd) {
-                // A tab or the view button: no selection starts under them.
-                match hit {
-                    Hit::Tab(i) => with(|a| {
-                        if let Some(&id) = a.order().get(i) {
-                            a.focus_id(id);
-                        }
-                    }),
-                    Hit::Button => toggle_view(hwnd, View::Tabs),
-                    Hit::Home => go_home(hwnd),
-                }
+            if let (Some(i), _) = chrome_at(hwnd) {
+                // A tab: no selection starts under it.
+                with(|a| {
+                    if let Some(&id) = a.order().get(i) {
+                        a.focus_id(id);
+                    }
+                });
                 let _ = InvalidateRect(Some(hwnd), None, false);
             } else if let Some((path, _)) = divider_at(hwnd) {
                 with(|a| a.drag = Some(path));
@@ -2852,9 +3005,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSEMOVE => {
             let ((x, y), (w, h)) = (mouse(hwnd), client(hwnd));
             let (moved, selecting, hover, track) = with(|a| {
-                let before = hover_state(a.view, a.panes.len(), a.mouse, w);
+                let before = a.mouse.and_then(|m| tab_at(a.view, a.panes.len(), m, w));
                 a.mouse = Some((x, y));
-                let hover = hover_state(a.view, a.panes.len(), a.mouse, w) != before;
+                let hover = tab_at(a.view, a.panes.len(), (x, y), w) != before;
                 let track = !std::mem::replace(&mut a.tracking, true);
                 let mut dragged = false;
                 if let (Some(path), Some(t)) = (&a.drag, &mut a.tree) {
@@ -2887,6 +3040,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSELEAVE => {
             with(|a| {
                 a.mouse = None;
+                a.cap_hot = None;
                 a.tracking = false;
             });
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2924,6 +3078,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         WM_CAPTURECHANGED => with(|a| {
+            a.cap_down = None;
             a.drag = None;
             a.select = None;
         }),
@@ -2992,7 +3147,7 @@ fn main() {
         RegisterClassW(&wc);
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
-                d2d, dw, format, bold, label, tab, font_size: FONT_SIZE, cell, target: None, bash, panes: Vec::new(),
+                d2d, dw, format, bold, label, tab, cap_hot: None, cap_down: None, font_size: FONT_SIZE, cell, target: None, bash, panes: Vec::new(),
                 focus: 0, next_id: 0, tree: None, drag: None, surrogate: 0, skip_char: false,
                 select: None, click: (0, f32::MIN, f32::MIN, 0),
                 home: std::env::var("USERPROFILE").ok(), rename: None, title: "dterm".into(),
@@ -3011,8 +3166,15 @@ fn main() {
         let dark = BOOL(1);
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
         let backdrop = DWMSBT_TRANSIENTWINDOW;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as _, 4);
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
+        if DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop as *const _ as _, 4).is_ok() {
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 });
+        } else {
+            // Windows 10 and Windows 11 before 22H2 have no system backdrops. The extended frame
+            // would hide the accent's acrylic behind black, so it is left out.
+            ACCENT.store(set_accent(hwnd, ACCENT_ACRYLIC), Ordering::Relaxed);
+            let flags = SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+            let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, flags); // WM_NCCALCSIZE drops the system frame
+        }
 
         // With a last or saved session, start on the landing page; otherwise straight in a new one.
         let rows = data_dir().map(|d| landing_rows(&d, &ago)).unwrap_or_default();
@@ -3156,17 +3318,11 @@ fn check() {
     let content = (0.0, TAB_H, 1000.0, 600.0 - TAB_H); // the same area for every tab
     assert_eq!(place(&t, tb, 1, (1000.0, 600.0)), [(0, content), (1, content), (2, content)]);
     assert_eq!((tab_width(3, 970.0), tab_width(10, 970.0), tab_width(2, -5.0)), (TAB_MAX, 97.0, 0.0));
-    // 3 tabs of 180 DIPs from the left; the button is the strip's last TAB_H.
-    let hit = |view, x, y| chrome_hit(view, 3, (x, y), 1000.0);
-    assert_eq!((hit(tb, 10.0, 10.0), hit(tb, 370.0, 29.0), hit(tb, 539.0, 0.0)), (Some(Hit::Tab(0)), Some(Hit::Tab(2)), Some(Hit::Tab(2))));
-    assert_eq!((hit(tb, 541.0, 10.0), hit(tb, 10.0, 30.0), hit(tb, -1.0, 10.0)), (None, None, None));
-    assert_eq!((hit(tb, 970.0, 10.0), hit(g, 970.0, 10.0), hit(z, 999.0, 0.0)), (Some(Hit::Button), Some(Hit::Button), Some(Hit::Button)));
-    assert_eq!((hit(g, 969.0, 10.0), hit(tb, 940.0, 0.0), hit(g, 939.0, 10.0)), (Some(Hit::Home), Some(Hit::Home), None));
-    assert_eq!((hit(g, 10.0, 10.0), hit(g, 970.0, 30.0)), (None, None));
-    // The grid's button shows only near the top edge.
-    let near = |y| hover_state(g, 3, Some((990.0, y)), 1000.0);
-    assert_eq!((near(10.0), near(35.0), near(36.0)), ((true, Some(Hit::Button)), (true, None), (false, None)));
-    assert_eq!(hover_state(g, 3, None, 1000.0), (false, None));
+    // 3 tabs of 180 DIPs from the left; nothing else in the strip, and no tabs in the grid.
+    let hit = |view, x, y| tab_at(view, 3, (x, y), 1000.0);
+    assert_eq!((hit(tb, 10.0, 10.0), hit(tb, 370.0, 29.0), hit(tb, 539.0, 0.0)), (Some(0), Some(2), Some(2)));
+    assert_eq!((hit(tb, 541.0, 10.0), hit(tb, 10.0, 30.0), hit(tb, -1.0, 10.0), hit(tb, 990.0, 10.0)), (None, None, None, None));
+    assert_eq!((hit(g, 10.0, 10.0), hit(z, 10.0, 10.0)), (None, None));
     // Ctrl+Shift+T: the largest pane (the focused one on a tie), along its longer side.
     let p = [(0.0, 0.0, 497.0, 600.0), (503.0, 0.0, 497.0, 297.0), (503.0, 303.0, 497.0, 297.0)];
     assert_eq!((auto_split(&p, 1), auto_split(&p, 2)), ((0, false), (0, false)));
@@ -3332,6 +3488,16 @@ fn check() {
     assert_eq!(descendant(&[(5, 6, "a".into()), (6, 5, "b".into())], 5, "c"), None);
     let dir = claude_project("N:\\Davide Chincoli\\12_CODING\\dterm").unwrap();
     assert_eq!(dir.file_name().unwrap(), "N--Davide-Chincoli-12-CODING-dterm");
+    // Own frame on Windows 10: edges resize, the caption drags except over its buttons.
+    let hit = |x, y, border| frame_hit((x, y), (800, 600), border, 32, (92, 138));
+    assert_eq!((hit(0, 0, 6), hit(799, 0, 6), hit(0, 599, 6), hit(799, 599, 6)), (HTTOPLEFT, HTTOPRIGHT, HTBOTTOMLEFT, HTBOTTOMRIGHT));
+    assert_eq!((hit(2, 300, 6), hit(797, 300, 6), hit(400, 2, 6), hit(400, 597, 6)), (HTLEFT, HTRIGHT, HTTOP, HTBOTTOM));
+    assert_eq!((hit(400, 20, 6), hit(700, 20, 6), hit(400, 40, 6), hit(400, 2, 0), hit(0, 300, 0)), (HTCAPTION, HTCLIENT, HTCLIENT, HTCAPTION, HTCLIENT));
+    assert_eq!((hit(50, 20, 6), hit(91, 20, 6), hit(92, 20, 6)), (HTCLIENT, HTCLIENT, HTCAPTION));
+    let at = |x, session| caption_button(x, 800.0, session);
+    assert_eq!((at(799.0, true), at(753.0, true), at(754.0, true), at(662.0, true), at(661.0, true), at(800.0, true)), (Some(4), Some(3), Some(4), Some(2), None, None));
+    assert_eq!((at(0.0, true), at(45.0, true), at(46.0, true), at(92.0, true), at(10.0, false)), (Some(0), Some(0), Some(1), None, None));
+    assert_eq!((caption_x(0, 800.0), caption_x(1, 800.0), caption_x(2, 800.0), caption_x(4, 800.0)), (0.0, 46.0, 662.0, 754.0));
 }
 
 #[test]
