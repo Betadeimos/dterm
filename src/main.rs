@@ -551,20 +551,46 @@ fn frame_hit((x, y): (i32, i32), (w, h): (i32, i32), border: i32, caption: i32, 
     }
 }
 
-/// Which caption button is at `x` in a `width` DIPs wide window: 0 start page and 1 grid / tabs at
-/// the left end (only while a `session` is shown), 2 minimize, 3 maximize and 4 close at the right.
+/// Which caption button is at `x` in a `width` DIPs wide window: 5 settings at the left end, then
+/// 0 start page and 1 grid / tabs (only while a `session` is shown), 2 minimize, 3 maximize and 4 close at the right.
 fn caption_button(x: f32, width: f32, session: bool) -> Option<usize> {
     let (left, right) = ((x / CAPTION_BTN).floor(), ((x - (width - 3.0 * CAPTION_BTN)) / CAPTION_BTN).floor());
     if (0.0..3.0).contains(&right) {
         Some(right as usize + 2)
+    } else if left == 0.0 {
+        Some(5)
     } else {
-        (session && (0.0..2.0).contains(&left)).then(|| left as usize)
+        (session && left < 3.0 && left > 0.0).then(|| left as usize - 1)
     }
 }
 
 /// Left edge of caption button `i` (see `caption_button`).
 fn caption_x(i: usize, width: f32) -> f32 {
-    if i < 2 { i as f32 * CAPTION_BTN } else { width - (5 - i) as f32 * CAPTION_BTN }
+    match i {
+        5 => 0.0,
+        0 | 1 => (i + 1) as f32 * CAPTION_BTN,
+        _ => width - (5 - i) as f32 * CAPTION_BTN,
+    }
+}
+
+/// How many caption buttons sit at the left end: settings, plus start page and grid / tabs with a session.
+fn left_buttons(session: bool) -> f32 {
+    if session { 3.0 } else { 1.0 }
+}
+
+/// The tooltip of caption button `i`: its action and the keys that do the same, as set in `keys`.
+fn caption_tip(i: usize, view: View, zoomed: bool, keys: &[Option<Chord>]) -> (&'static str, Option<String>) {
+    let keys_of = |act: Action| keys[act as usize].map(chord_text);
+    match i {
+        0 => ("Start page", keys_of(Action::Home)),
+        1 if view == View::Tabs => ("Grid view", keys_of(Action::Tabs)),
+        1 => ("Tabs view", keys_of(Action::Tabs)),
+        2 => ("Minimize", None),
+        3 if zoomed => ("Restore", None),
+        3 => ("Maximize", None),
+        4 => ("Close", Some("Alt+F4".into())),
+        _ => ("Settings", keys_of(Action::Settings)),
+    }
 }
 
 /// Whether panes are shown, so the start page and grid / tabs buttons make sense.
@@ -1663,21 +1689,40 @@ unsafe fn draw_caption(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCo
     // Centered in the window, clear of the buttons on both sides.
     let slot = rect(3.0 * CAPTION_BTN, 0.0, (width - 6.0 * CAPTION_BTN).max(0.0), CAPTION_H);
     rt.DrawText(&units, &a.tab, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
-    for i in if session_shown(a) { 0 } else { 2 }..5 {
+    for i in [5, 0, 1, 2, 3, 4].into_iter().filter(|&i| i > 1 || session_shown(a)) {
         let x = caption_x(i, width);
         if a.cap_hot == Some(i) {
-            // Close turns red like Windows' own; the others get a light wash.
-            brush.SetColor(&if i == 4 { color(rgb(0xE81123), 1.0) } else { color(fg(), 0.1) });
+            // Close turns red like Windows' own; the others get a light wash, a bit stronger while pressed.
+            let wash = if a.cap_down == Some(i) { 0.2 } else { 0.12 };
+            brush.SetColor(&if i == 4 { color(rgb(0xE81123), 1.0) } else { color(fg(), wash) });
             rt.FillRectangle(&rect(x, 0.0, CAPTION_BTN, CAPTION_H), brush);
         }
-        brush.SetColor(&color(fg(), 0.9));
+        brush.SetColor(&color(fg(), if a.cap_hot == Some(i) { 1.0 } else { 0.8 }));
         // 10 DIP glyphs on half pixels, so 1 DIP lines stay sharp at 100%.
         let (cx, cy) = ((x + CAPTION_BTN / 2.0).floor() + 0.5, (CAPTION_H / 2.0).floor() + 0.5);
         let line = |x0: f32, y0: f32, x1: f32, y1: f32| rt.DrawLine(windows_numerics::Vector2 { X: cx + x0, Y: cy + y0 }, windows_numerics::Vector2 { X: cx + x1, Y: cy + y1 }, brush, 1.0, None);
         let (bx, by) = ((cx - 0.5).round(), (cy - 0.5).round()); // whole-pixel center for filled glyphs
         match i {
-            // To the start page: three lines, like the list of sessions there.
-            0 => [0.0, 4.5, 9.0].into_iter().for_each(|dy| rt.FillRectangle(&rect(bx - 6.0, (by - 5.0 + dy).round(), 12.0, 1.5), brush)),
+            // To the start page: a house.
+            0 => {
+                rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                // One closed outline: walls, and a peaked roof on top.
+                let pts = [(-5.0, 5.5), (-5.0, -1.0), (0.0, -6.0), (5.0, -1.0), (5.0, 5.5), (-5.0, 5.5)];
+                pts.windows(2).for_each(|p| line(p[0].0, p[0].1, p[1].0, p[1].1));
+                rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            }
+            // Settings: a gear, a thick ring with eight chunky teeth around it.
+            5 => {
+                rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                let center = windows_numerics::Vector2 { X: cx, Y: cy };
+                rt.DrawEllipse(&D2D1_ELLIPSE { point: center, radiusX: 3.5, radiusY: 3.5 }, brush, 2.5, None);
+                for k in 0..8 {
+                    let (s, c) = (k as f32 * std::f32::consts::FRAC_PI_4).sin_cos();
+                    let tooth = |r: f32| windows_numerics::Vector2 { X: cx + r * c, Y: cy + r * s };
+                    rt.DrawLine(tooth(4.0), tooth(6.5), brush, 2.5, None);
+                }
+                rt.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            }
             // Back to the grid: 2 x 2 tiny squares.
             1 if a.view == View::Tabs => {
                 for (dx, dy) in [(0.0, 0.0), (6.0, 0.0), (0.0, 6.0), (6.0, 6.0)] {
@@ -1705,6 +1750,33 @@ unsafe fn draw_caption(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCo
             }
         }
     }
+    // The tooltip: action name, then its shortcut dimmer, in a small box under the hovered button.
+    if let (Some(i), None) = (a.cap_hot, a.cap_down) {
+        let (name, keys) = caption_tip(i, a.view, zoomed, &a.settings.keys);
+        let width_of = |t: &str| {
+            let units: Vec<u16> = t.encode_utf16().collect();
+            let mut m = DWRITE_TEXT_METRICS::default();
+            a.dw.CreateTextLayout(&units, &a.tab, 10_000.0, CAPTION_H).and_then(|l| l.GetMetrics(&mut m)).map_or(0.0, |_| m.widthIncludingTrailingWhitespace.ceil())
+        };
+        let gap = 10.0;
+        let (nw, kw) = (width_of(name), keys.as_deref().map_or(0.0, |k| width_of(k)));
+        let bw = nw + if keys.is_some() { gap + kw } else { 0.0 } + 16.0;
+        let bx = (caption_x(i, width) + CAPTION_BTN / 2.0 - bw / 2.0).clamp(4.0, (width - bw - 4.0).max(4.0));
+        let r = rect(bx, CAPTION_H + 4.0, bw, 24.0);
+        brush.SetColor(&color(bg(), 0.97));
+        rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: r, radiusX: 5.0, radiusY: 5.0 }, brush);
+        brush.SetColor(&color(fg(), 0.25));
+        rt.DrawRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(bx + 0.5, r.top + 0.5, bw - 1.0, 23.0), radiusX: 5.0, radiusY: 5.0 }, brush, 1.0, None);
+        let draw = |t: &str, x: f32, w: f32, alpha: f32| {
+            brush.SetColor(&color(fg(), alpha));
+            let units: Vec<u16> = t.encode_utf16().collect();
+            rt.DrawText(&units, &a.tab, &rect(x, r.top, w, 24.0), brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+        };
+        draw(name, bx + 8.0, nw, 0.95);
+        if let Some(k) = &keys {
+            draw(k, bx + 8.0 + nw + gap, kw, 0.5);
+        }
+    }
 }
 
 /// The mouse over dterm's own caption buttons: hover, press, and the click when released over the
@@ -1727,6 +1799,7 @@ unsafe fn caption_mouse(hwnd: HWND, msg: u32) -> bool {
             let cmd = match over {
                 _ if over != down => return true,
                 Some(0) => return { go_home(hwnd); true },
+                Some(5) => return { run(hwnd, Action::Settings); true },
                 Some(1) => return { toggle_view(hwnd, View::Tabs); true },
                 Some(2) => SC_MINIMIZE,
                 Some(3) if IsZoomed(hwnd).as_bool() => SC_RESTORE,
@@ -2892,7 +2965,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
             let ((w, h), s) = (client_px(hwnd), scale(hwnd));
             let border = if IsZoomed(hwnd).as_bool() { 0 } else { (RESIZE_BORDER * s) as i32 };
-            let left = if with(|a| session_shown(a)) { 2.0 * CAPTION_BTN * s } else { 0.0 };
+            let left = left_buttons(with(|a| session_shown(a))) * CAPTION_BTN * s;
             let buttons = (left as i32, (3.0 * CAPTION_BTN * s) as i32);
             let hit = frame_hit((pt.x, pt.y), (w as i32, h as i32), border, (CAPTION_H * s) as i32, buttons);
             return LRESULT(hit as isize);
@@ -3489,15 +3562,24 @@ fn check() {
     let dir = claude_project("N:\\Davide Chincoli\\12_CODING\\dterm").unwrap();
     assert_eq!(dir.file_name().unwrap(), "N--Davide-Chincoli-12-CODING-dterm");
     // Own frame on Windows 10: edges resize, the caption drags except over its buttons.
-    let hit = |x, y, border| frame_hit((x, y), (800, 600), border, 32, (92, 138));
+    let hit = |x, y, border| frame_hit((x, y), (800, 600), border, 32, (138, 138));
     assert_eq!((hit(0, 0, 6), hit(799, 0, 6), hit(0, 599, 6), hit(799, 599, 6)), (HTTOPLEFT, HTTOPRIGHT, HTBOTTOMLEFT, HTBOTTOMRIGHT));
     assert_eq!((hit(2, 300, 6), hit(797, 300, 6), hit(400, 2, 6), hit(400, 597, 6)), (HTLEFT, HTRIGHT, HTTOP, HTBOTTOM));
     assert_eq!((hit(400, 20, 6), hit(700, 20, 6), hit(400, 40, 6), hit(400, 2, 0), hit(0, 300, 0)), (HTCAPTION, HTCLIENT, HTCLIENT, HTCAPTION, HTCLIENT));
-    assert_eq!((hit(50, 20, 6), hit(91, 20, 6), hit(92, 20, 6)), (HTCLIENT, HTCLIENT, HTCAPTION));
+    assert_eq!((hit(50, 20, 6), hit(137, 20, 6), hit(138, 20, 6)), (HTCLIENT, HTCLIENT, HTCAPTION));
     let at = |x, session| caption_button(x, 800.0, session);
     assert_eq!((at(799.0, true), at(753.0, true), at(754.0, true), at(662.0, true), at(661.0, true), at(800.0, true)), (Some(4), Some(3), Some(4), Some(2), None, None));
-    assert_eq!((at(0.0, true), at(45.0, true), at(46.0, true), at(92.0, true), at(10.0, false)), (Some(0), Some(0), Some(1), None, None));
-    assert_eq!((caption_x(0, 800.0), caption_x(1, 800.0), caption_x(2, 800.0), caption_x(4, 800.0)), (0.0, 46.0, 662.0, 754.0));
+    assert_eq!((at(0.0, true), at(45.0, true), at(46.0, true), at(92.0, true), at(138.0, true)), (Some(5), Some(5), Some(0), Some(1), None));
+    assert_eq!((at(10.0, false), at(60.0, false)), (Some(5), None));
+    assert_eq!((caption_x(5, 800.0), caption_x(0, 800.0), caption_x(1, 800.0), caption_x(2, 800.0), caption_x(4, 800.0)), (0.0, 46.0, 92.0, 662.0, 754.0));
+    // Tooltips read the current shortcuts.
+    let mut keys = Settings::default().keys;
+    assert_eq!(caption_tip(5, View::Grid, false, &keys), ("Settings", Some("Ctrl+Alt+Comma".into())));
+    keys[Action::Tabs as usize] = parse_chord("Ctrl+Alt+Y");
+    assert_eq!(caption_tip(1, View::Grid, false, &keys), ("Tabs view", Some("Ctrl+Alt+Y".into())));
+    keys[Action::Home as usize] = None;
+    assert_eq!(caption_tip(0, View::Grid, false, &keys), ("Start page", None));
+    assert_eq!(caption_tip(3, View::Grid, true, &keys), ("Restore", None));
 }
 
 #[test]
