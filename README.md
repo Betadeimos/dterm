@@ -5,7 +5,7 @@
 <p align="center"><b>A native Windows terminal that puts all your shells, and your coding agents, in one grid.</b><br>
 One exe under 500 KB. No Electron. No config.</p>
 
-![dterm demo: adding panes, zoom, tabs, settings and themes, saving and reopening a session](assets/demo.gif)
+![dterm demo: the start page, a saved session, adding panes, zoom, tabs, then themes and opacity in settings](assets/demo.gif)
 
 ## Why dterm
 
