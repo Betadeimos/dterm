@@ -1491,6 +1491,7 @@ struct App {
     prompt: Option<String>,      // session name being typed for the save-session shortcut
     toast: Option<String>,       // short note after saving
     created: u64,                // when this session started (Unix seconds), kept across restores
+    file: Option<std::path::PathBuf>, // the saved session this window is; Save writes over it
     settings: Settings,
     page: Option<SettingsPage>,  // the settings page, shown over the panes or the landing page
 }
@@ -2240,7 +2241,7 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
     } else if l.armed {
         (format!("press Del again to delete \u{201c}{}\u{201d}", row.label), theme().ansi[1])
     } else if l.rename.is_some() {
-        ("Enter renames   Esc cancels".to_string(), theme().fg)
+        (if row.kind == Kind::Live { "Enter saves it under this name as a new session   Esc cancels" } else { "Enter renames   Esc cancels" }.to_string(), theme().fg)
     } else if l.leaving {
         (format!("press Enter again to close this session and open \u{201c}{}\u{201d}", row.label), theme().ansi[3])
     } else {
@@ -2524,10 +2525,31 @@ unsafe fn set_font(hwnd: HWND, size: f32) {
     }
 }
 
+/// Write `s` to `file`. False when writing failed.
+fn write_session(file: &std::path::Path, s: &Session) -> bool {
+    file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::write(file, session_text(s)).is_ok()
+}
+
 /// Write the current session to `file`. False when there is nothing to save or writing failed.
 fn save_session(file: &std::path::Path) -> bool {
-    let Some(s) = with(|a| a.session()) else { return false };
-    file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::write(file, session_text(&s)).is_ok()
+    with(|a| a.session()).is_some_and(|s| write_session(file, &s))
+}
+
+/// The file of the saved session called `name` (already cleaned by `session_file_name`).
+fn session_path(name: &str) -> Option<std::path::PathBuf> {
+    data_dir().map(|d| d.join("sessions").join(format!("{name}.session")))
+}
+
+/// Say something for a moment near the bottom of the window.
+unsafe fn toast(hwnd: HWND, text: String) {
+    with(|a| a.toast = Some(text));
+    SetTimer(Some(hwnd), TOAST_TIMER, 1500, None);
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// A session file's name without the extension.
+fn stem(file: &std::path::Path) -> String {
+    file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
 /// Closing the window remembers the session for the landing page's "Last session".
@@ -2608,7 +2630,9 @@ unsafe fn open_choice(hwnd: HWND, i: usize) {
     }
     let session = with(|a| {
         a.created = now(); // a new session starts now; a restored one takes its own time
-        a.landing.take().and_then(|l| l.rows.into_iter().nth(i)).and_then(|c| c.session)
+        let row = a.landing.take().and_then(|l| l.rows.into_iter().nth(i));
+        a.file = row.as_ref().filter(|c| c.kind == Kind::Saved).and_then(|c| c.file.clone());
+        row.and_then(|c| c.session)
     });
     if !session.is_some_and(|s| open_session(hwnd, s)) {
         add_pane(hwnd, None);
@@ -2628,8 +2652,10 @@ unsafe fn go_home(hwnd: HWND) {
     with(|a| {
         let Some(s) = a.session() else { return };
         // The last session is this one now, so it shows up only as the running one.
-        let mut rows: Vec<Choice> = rows.into_iter().filter(|r| r.kind != Kind::Last).collect();
-        rows.insert(1, choice("This session".into(), s, None, Kind::Live, &ago));
+        // A session opened from a file or saved keeps its name and replaces its own saved row.
+        let mut rows: Vec<Choice> = rows.into_iter().filter(|r| r.kind != Kind::Last && (r.file.is_none() || r.file != a.file)).collect();
+        let label = a.file.as_deref().map_or("This session".into(), stem);
+        rows.insert(1, choice(label, s, None, Kind::Live, &ago));
         let mut l = Landing::new(rows);
         l.sel = 1; // the running session
         a.landing = Some(l);
@@ -2640,7 +2666,7 @@ unsafe fn go_home(hwnd: HWND) {
 
 /// Start renaming the selected saved session on the landing page, with its name to edit.
 fn start_rename(a: &mut App) {
-    if let Some(l) = a.landing.as_mut().filter(|l| l.saved()) {
+    if let Some(l) = a.landing.as_mut().filter(|l| l.saved() || l.rows.get(l.sel).is_some_and(|r| r.kind == Kind::Live)) {
         l.calm();
         l.rename = Some(l.rows[l.sel].label.clone());
     }
@@ -2656,18 +2682,48 @@ fn press_delete(a: &mut App) {
     }
 }
 
+/// Renaming the running session adds a new saved session under the new name and keeps the old
+/// one as it was. The window is the new one from now on.
+unsafe fn save_as_new(hwnd: HWND, typed: &str) {
+    let Some(name) = session_file_name(typed) else {
+        with(|a| a.landing.as_mut().map(|l| l.note = Some("a name needs letters or digits")));
+        return;
+    };
+    let Some(file) = session_path(&name) else { return };
+    if with(|a| a.file.as_ref() == Some(&file)) {
+        return;
+    }
+    let note = if file.exists() {
+        Some("a session with that name exists")
+    } else if !save_session(&file) {
+        Some("could not save the session")
+    } else {
+        None
+    };
+    if note.is_none() {
+        with(|a| a.file = Some(file));
+    }
+    go_home(hwnd); // rebuilds the rows: the old session is saved again, this one runs under its new name
+    with(|a| a.landing.as_mut().map(|l| l.note = note));
+}
+
 /// Keys on the landing page: ↑↓ choose, Enter opens, Esc opens the first choice (the running
 /// session, else a new one), F2 renames and Del (twice) deletes a saved one. While a name is
 /// typed, Enter keeps it, Esc drops it, and the other keys edit it.
 unsafe fn landing_key(hwnd: HWND, vk: u16) {
     if with(|a| a.landing.as_ref().is_some_and(|l| l.rename.is_some())) {
+        let mut save_as = None;
         with(|a| {
             let Some(l) = a.landing.as_mut() else { return };
             match vk {
                 0x0D | 0x1B => {
                     a.skip_char = true;
                     let typed = l.rename.take().unwrap_or_default();
-                    l.note = if vk == 0x0D { l.rename_to(&typed).err() } else { None };
+                    if vk == 0x0D && l.rows[l.sel].kind == Kind::Live {
+                        save_as = Some(typed); // below, outside the borrow
+                    } else {
+                        l.note = if vk == 0x0D { l.rename_to(&typed).err() } else { None };
+                    }
                 }
                 0x08 => {
                     l.rename.as_mut().map(|t| t.pop());
@@ -2675,6 +2731,9 @@ unsafe fn landing_key(hwnd: HWND, vk: u16) {
                 _ => {}
             }
         });
+        if let Some(typed) = save_as {
+            save_as_new(hwnd, &typed);
+        }
         let _ = InvalidateRect(Some(hwnd), None, false);
         return;
     }
@@ -2801,9 +2860,12 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
 unsafe fn end_prompt(hwnd: HWND, keep: bool) {
     let typed = with(|a| a.prompt.take());
     if let (true, Some(name)) = (keep, typed.as_deref().and_then(session_file_name)) {
-        let saved = data_dir().is_some_and(|d| save_session(&d.join("sessions").join(format!("{name}.session"))));
-        with(|a| a.toast = Some(if saved { format!("saved \u{201c}{name}\u{201d}") } else { "could not save".into() }));
-        SetTimer(Some(hwnd), TOAST_TIMER, 1500, None);
+        let file = session_path(&name).filter(|f| save_session(f));
+        let saved = file.is_some();
+        if file.is_some() {
+            with(|a| a.file = file);
+        }
+        toast(hwnd, if saved { format!("saved \u{201c}{name}\u{201d}") } else { "could not save".into() });
     }
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
@@ -2887,10 +2949,17 @@ unsafe fn run(hwnd: HWND, act: Action) {
             }
         }
         Action::Rename => begin_rename(hwnd),
-        Action::Save => {
-            with(|a| (a.prompt, a.toast) = (Some(String::new()), None));
-            let _ = InvalidateRect(Some(hwnd), None, false);
-        }
+        // A session that already has a file is saved over it; a new one asks for a name.
+        Action::Save => match with(|a| a.file.clone()) {
+            Some(file) => {
+                let saved = save_session(&file);
+                toast(hwnd, if saved { format!("saved \u{201c}{}\u{201d}", stem(&file)) } else { "could not save".into() });
+            }
+            None => {
+                with(|a| (a.prompt, a.toast) = (Some(String::new()), None));
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        },
         Action::Zoom => toggle_view(hwnd, View::Zoom),
         Action::Tabs => toggle_view(hwnd, View::Tabs),
         Action::Home => go_home(hwnd),
@@ -3560,7 +3629,7 @@ fn main() {
                 select: None, click: (0, f32::MIN, f32::MIN, 0),
                 home: std::env::var("USERPROFILE").ok(), rename: None, title: "dterm".into(),
                 view: View::Grid, mouse: None, tracking: false, landing: None, prompt: None, toast: None,
-                created: now(), settings, page: None,
+                created: now(), file: None, settings, page: None,
             })
         });
         let hwnd = CreateWindowExW(

@@ -6,10 +6,11 @@
 
 ![dterm with four panes: git log, color test, cargo test and an agent session](assets/screenshot.png)
 
-One native exe (about 470 KB), nothing to configure. Panes run Git Bash and look like Windows
+One native exe (about 490 KB), nothing to configure. Panes run Git Bash and look like Windows
 Terminal: acrylic background (kept when the window isn't focused), One Half Dark colors,
 Cascadia Mono, font fallback for symbols and emoji. Each pane shows a faint name, and sessions
-come back: close dterm and it offers to reopen the same panes in the same folders.
+come back: close dterm and it offers to reopen the same panes in the same folders. A pane that is
+not focused is tinted while it works (blue), when it finishes (green) and when it rings the bell (yellow).
 
 ## Shortcuts
 
@@ -26,7 +27,7 @@ keyboard), that character wins, and left Ctrl + left Alt give the shortcut.
 | Ctrl+Alt+R * | Rename the focused pane |
 | Ctrl+Alt+Z * | Zoom the focused pane to the whole window, and back |
 | Ctrl+Alt+G * | Switch between grid and tabs (also the button in the title bar, top-left) |
-| Ctrl+Alt+S * | Save the session under a name |
+| Ctrl+Alt+S * | Save the session: over its file if it has one, else it asks for a name |
 | Ctrl+Alt+H * | Go to the start page (also the ≡ button, top-left); the session keeps running |
 | Ctrl+Alt+Comma * | Settings |
 | Alt+Arrow keys | Move focus to the pane in that direction (in tabs: Left / Right pick the previous / next tab) |
@@ -45,11 +46,11 @@ keyboard), that character wins, and left Ctrl + left Alt give the shortcut.
 ## Sessions
 
 Closing the window (X button, Alt+F4, shutdown) or going to the start page saves the session (layout, each pane's folder and name, view, font size) to
-`%APPDATA%\dterm\last.session`; closing the last pane with `exit` ends dterm without saving. Ctrl+Alt+S saves it under a name in `%APPDATA%\dterm\sessions`.
+`%APPDATA%\dterm\last.session`; closing the last pane with `exit` ends dterm without saving. Ctrl+Alt+S saves it under a name in `%APPDATA%\dterm\sessions`; once it has a name, Ctrl+Alt+S saves over it. A session stays the same session: opening a saved one keeps it open under its name, and saving writes over it.
 When something is saved, dterm starts on a small landing page: pick the last session, a saved
 one (with a preview of its layout and when it was started and closed), or a new one.
-On the landing page, ↑↓ or the mouse choose, Enter or a click opens, Esc opens the first choice, F2 renames and Del (twice) deletes a saved one (or click the pencil / bin icons on the selected row). A footer bar lists the keys, with your own shortcuts. Ctrl+Alt+H brings the landing page back while you work: the running session stays first in the
-list (Esc returns to it), and opening another one closes it after asking once.
+On the landing page, ↑↓ or the mouse choose, Enter or a click opens, Esc opens the first choice, F2 renames and Del (twice) deletes a saved one (or click the pencil / bin icons on the selected row). F2 on the running session saves it as a new session under the new name and leaves the old one as it was. A footer bar lists the keys, with your own shortcuts. Ctrl+Alt+H brings the landing page back while you work: the running session stays first in the
+list under its own name (Esc returns to it), and opening another one closes it after asking once.
 
 Panes that run [Claude Code](https://claude.com/claude-code) come back inside it: dterm saves
 each one's newest conversation and restores it with `claude --resume <id>`.
@@ -87,10 +88,15 @@ build needs no resource compiler. To change it, draw a new one with `assets\icon
 `.\release.ps1` builds `dist\dterm-vX.Y.Z.exe` and a zip for the version in `Cargo.toml`;
 `.\release.ps1 -Publish` also tags it and creates the GitHub release (needs the GitHub CLI).
 
+## Pane status
+
+A pane that is not focused tints its name: blue while output streams, green once it goes quiet,
+yellow after it rings the bell (for example an agent asking for you). Focusing the pane clears it.
+The tint is still subtle; making it easier to see is on the roadmap.
+
 ## Status
 
-Early, but in daily use. See [ROADMAP.md](ROADMAP.md) for what's next, like per-pane agent
-status (busy / done / waiting for you) and broadcast input.
+Early, but in daily use. See [ROADMAP.md](ROADMAP.md) for what's next, like broadcast input.
 
 ## License
 

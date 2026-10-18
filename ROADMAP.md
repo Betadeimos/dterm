@@ -4,6 +4,20 @@ Goal: be a better daily terminal than Windows Terminal for people who run severa
 (and coding agents like Claude Code) side by side. Small native exe, zero config, looks like
 Windows Terminal, but built around the grid.
 
+## Feedback round 4 (done in v0.2.1)
+
+- [x] **Agent status per pane:** the name of a background pane is tinted blue while it streams
+  output, green once it goes quiet, yellow after a bell; focusing clears it (also on tab names).
+  Shared atomics from the PTY thread, a timer only while a pane is busy, no new crates.
+- [x] **A session stays the same session:** opening a saved one keeps it open under its name (the
+  landing page used to show it as a new "This session"); Ctrl+Alt+S saves over its file, or asks
+  for a name the first time; F2 on the running session saves it as a new session and leaves the
+  old one as it was.
+- [ ] **Status colours are hard to see:** the tint is too faint on the label. Make it easier to
+  notice (stronger colour, a dot or a border cue) without turning it loud. Also: OSC 9/777
+  notifications and OSC 133 prompt marks as signals, and count the focused pane of an inactive
+  window as a background pane.
+
 ## Feedback round 3 (done in v0.2.0)
 
 - [x] **Ctrl+Shift+S did nothing** on the user's machine (it worked in automated tests). Every
@@ -28,7 +42,7 @@ Windows Terminal, but built around the grid.
 - [x] **Settings page** (Ctrl+Alt+Comma, keyboard only): theme (One Half Dark, Campbell, Catppuccin
   Mocha, Dracula), opacity, and every shortcut (Enter, press keys; Del = default; keys already
   used move over). Saved to `%APPDATA%\dterm\settings`.
-- [x] **Versions and releases:** 0.2.0, shown on the landing page. `release.ps1` builds
+- [x] **Versions and releases:** shown on the landing page. `release.ps1` builds
   `dist\dterm-vX.Y.Z.exe` and `.zip`; `-Publish` tags and runs `gh release create`.
 - [ ] Later: a GitHub Actions workflow that builds the release on tag push; mouse support on the
   settings page (the landing page and tabs already take the mouse); font family and size in settings.
@@ -68,10 +82,6 @@ Windows Terminal defaults in brackets, so muscle memory carries over.
       Fades while you type in that pane. No title bars, no chrome.
 - [x] **Agent status per pane:** the name of a background pane is tinted blue while it streams
       output, green once it goes quiet, yellow after a bell. Focusing the pane clears it.
-- [ ] **Status colours are hard to see:** the tint is too faint on the label. Make it easier to
-      notice (stronger colour, a dot or a border cue) without turning it loud. Also: OSC 9/777
-      notifications and OSC 133 prompt marks as signals, and count the focused pane of an
-      inactive window as a background pane.
 
 ### Sessions
 - [x] **Session restore + landing page.** On start, a terminal-style menu (like opencode):
@@ -116,7 +126,7 @@ WT does **not** have:
    Signals: output activity, the bell, OSC 9/777 notifications, OSC 133 prompt marks.
 3. **Sessions that come back** with names and folders, from a quick landing page.
 4. **Broadcast input:** type once into all panes (or a chosen set).
-5. **Stays tiny:** one native exe (~470 KB today), instant start, no Electron, no settings file needed.
+5. **Stays tiny:** one native exe (~490 KB today), instant start, no Electron, no settings file needed.
 
 ## Other open-source grid terminals
 
