@@ -66,6 +66,12 @@ Windows Terminal defaults in brackets, so muscle memory carries over.
 - [x] **Pane names without headers:** a small, low-contrast label in the pane's top-right corner
       (folder name by default, or the title the shell/app sets via OSC 0/2, or a name you type).
       Fades while you type in that pane. No title bars, no chrome.
+- [x] **Agent status per pane:** the name of a background pane is tinted blue while it streams
+      output, green once it goes quiet, yellow after a bell. Focusing the pane clears it.
+- [ ] **Status colours are hard to see:** the tint is too faint on the label. Make it easier to
+      notice (stronger colour, a dot or a border cue) without turning it loud. Also: OSC 9/777
+      notifications and OSC 133 prompt marks as signals, and count the focused pane of an
+      inactive window as a background pane.
 
 ### Sessions
 - [x] **Session restore + landing page.** On start, a terminal-style menu (like opencode):
