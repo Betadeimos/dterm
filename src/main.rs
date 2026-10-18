@@ -164,6 +164,8 @@ const LAND_Y: f32 = 56.0;
 const LAND_ROWS: f32 = LAND_Y + 130.0; // first choice, below the logo and tagline
 const LOGO_SIZE: f32 = 44.0; // DIPs
 const PREVIEW: (f32, f32) = (320.0, 200.0); // DIPs, the selected session's layout
+const ICON_W: f32 = 28.0; // DIPs, width of a landing row's rename or delete icon
+const FOOT_H: f32 = 30.0; // DIPs, the landing page's footer bar
 const PROMPT_MAX: usize = 40; // characters of a typed session name
 const TOAST_TIMER: usize = 1; // hides the "saved" note
 
@@ -938,13 +940,80 @@ struct Choice {
     kind: Kind,
 }
 
-/// The landing page: its choices, the selected one, whether Del was pressed once on it, and
-/// whether Enter was pressed once to leave the running session for it.
+/// The landing page: its choices, the selected one, whether Del was pressed once on it,
+/// whether Enter was pressed once to leave the running session for it, the new name while a
+/// saved session is renamed, and a note about the last rename or delete that failed.
 struct Landing {
     rows: Vec<Choice>,
     sel: usize,
     armed: bool,
     leaving: bool,
+    rename: Option<String>,
+    note: Option<&'static str>,
+}
+
+impl Landing {
+    fn new(rows: Vec<Choice>) -> Self {
+        Landing { rows, sel: 0, armed: false, leaving: false, rename: None, note: None }
+    }
+
+    /// The choice Esc and the start page key open: the running session, else a new one.
+    fn first(&self) -> usize {
+        self.rows.iter().position(|r| r.kind == Kind::Live).unwrap_or(0)
+    }
+
+    /// Drop the pending questions and notes (the selection moved or something else was done).
+    fn calm(&mut self) {
+        (self.armed, self.leaving, self.rename, self.note) = (false, false, None, None);
+    }
+
+    /// Whether the selected choice is a saved session, the only kind that can be renamed or deleted.
+    fn saved(&self) -> bool {
+        self.rows.get(self.sel).is_some_and(|r| r.kind == Kind::Saved)
+    }
+
+    /// Delete the selected saved session's file and its row. False when it could not be removed.
+    fn delete(&mut self) -> bool {
+        if !self.saved() {
+            return false;
+        }
+        if let Some(f) = &self.rows[self.sel].file {
+            if std::fs::remove_file(f).is_err() && f.exists() {
+                (self.armed, self.note) = (false, Some("could not delete the file"));
+                return false;
+            }
+        }
+        self.rows.remove(self.sel);
+        self.sel = self.sel.min(self.rows.len() - 1);
+        self.calm();
+        true
+    }
+
+    /// Rename the selected saved session's file to `name` (cleaned like a save name) and keep the
+    /// saved ones sorted. Fails with a note, leaving everything as it was.
+    fn rename_to(&mut self, name: &str) -> Result<(), &'static str> {
+        if !self.saved() {
+            return Err("only saved sessions can be renamed");
+        }
+        let new = session_file_name(name).ok_or("a name needs letters or digits")?;
+        let row = &mut self.rows[self.sel];
+        if new == row.label {
+            return Ok(());
+        }
+        let old = row.file.clone().ok_or("session has no file")?;
+        let to = old.with_file_name(format!("{new}.session"));
+        // Only a change of letter case may land on the file's own name.
+        if to.exists() && new.to_lowercase() != row.label.to_lowercase() {
+            return Err("a session with that name exists");
+        }
+        std::fs::rename(&old, &to).map_err(|_| "could not rename the file")?;
+        row.label = new.clone();
+        row.file = Some(to);
+        let first = self.rows.iter().position(|r| r.kind == Kind::Saved).unwrap_or(0);
+        self.rows[first..].sort_by_key(|r| r.label.to_lowercase());
+        self.sel = first + self.rows[first..].iter().position(|r| r.label == new).unwrap_or(0);
+        Ok(())
+    }
 }
 
 fn pane_count(n: usize) -> String {
@@ -1002,6 +1071,22 @@ fn landing_row(y: f32, line_h: f32, rows: usize) -> Option<usize> {
 /// Height of one landing page row for cells `cell_h` DIPs tall.
 fn land_line(cell_h: f32) -> f32 {
     cell_h + 12.0
+}
+
+/// Where the landing page's closed column starts (DIPs right of `LAND_X`), and how wide its list
+/// is, with room for the rename and delete icons at the right end. Cells are `cw` DIPs wide.
+fn land_metrics(l: &Landing, cw: f32) -> (f32, f32) {
+    let chars = |f: fn(&Choice) -> &String| l.rows.iter().map(|r| f(r).chars().count()).max().unwrap_or(0) as f32;
+    let typed = l.rename.as_ref().map_or(0, |t| t.chars().count() + 1) as f32;
+    let closed = (8.0 + chars(|r| &r.label).max(typed) + chars(|r| &r.detail)) * cw;
+    (closed, closed + (chars(|r| &r.closed) + 9.0) * cw + 2.0 * ICON_W)
+}
+
+/// The icon under `x` DIPs on a landing row of a list `list_w` wide: `Some(false)` rename,
+/// `Some(true)` delete.
+fn land_icon(x: f32, list_w: f32) -> Option<bool> {
+    let left = LAND_X + list_w - 2.0 * ICON_W;
+    ((left..left + 2.0 * ICON_W).contains(&x)).then(|| x >= left + ICON_W)
 }
 
 /// The line under the landing page's preview: what a new session is, or when a saved one was
@@ -1878,7 +1963,7 @@ unsafe fn paint(hwnd: HWND) {
         }
         if let Some(l) = &a.landing {
             rt.Clear(Some(&color(bg(), a.settings.opacity)));
-            draw_landing(a, l, rt, brush, w as f32 / s);
+            draw_landing(a, l, rt, brush, (w as f32 / s, h as f32 / s - CAPTION_H));
             draw_caption(a, rt, brush, w as f32 / s, zoomed);
             if rt.EndDraw(None, None).is_err() {
                 a.target = None;
@@ -1935,8 +2020,9 @@ unsafe fn paint(hwnd: HWND) {
 }
 
 /// The landing page, terminal style: the logo, the choices (the selected one bright with a green
-/// ❯), and a hint line.
-unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, width: f32) {
+/// ❯ and, if saved, rename and delete icons), its layout in a card, and a footer bar with the keys.
+/// `(width, height)` is the area below the title bar, in DIPs.
+unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, (width, height): (f32, f32)) {
     let (cw, ch) = a.cell;
     let lh = land_line(ch);
     let text = |s: &str, f: &IDWriteTextFormat, r: D2D_RECT_F, c: u32, alpha: f32| {
@@ -1955,42 +2041,102 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
     }
     let tagline = format!("terminals in a grid, sessions that come back  \u{b7}  v{}", env!("CARGO_PKG_VERSION"));
     let live = l.rows.iter().any(|r| r.kind == Kind::Live);
-    let keys = format!("\u{2191}\u{2193} choose   Enter open   Del delete   Esc {}", if live { "back" } else { "new" });
-    // The shortcuts that matter here, as set on the settings page.
-    let shortcut = |act: Action, what: &str| a.settings.keys[act as usize].map(|k| format!("{} {what}", chord_text(k)));
-    let more = [shortcut(Action::Save, "saves a session"), shortcut(Action::Home, "comes back here"), shortcut(Action::Settings, "settings")];
-    let more = more.into_iter().flatten().collect::<Vec<_>>().join("   ");
     line(&tagline, LAND_X + 2.0, LAND_Y + LOGO_SIZE * 1.45, theme().fg, 0.4);
 
     // The choices: label, pane count, when it was last closed.
-    let chars = |f: fn(&Choice) -> &String| l.rows.iter().map(|r| f(r).chars().count()).max().unwrap_or(0) as f32;
-    let (lw, dw) = (chars(|r| &r.label), chars(|r| &r.detail));
-    let closed_x = LAND_X + (6.0 + lw + dw) * cw;
-    let list_w = (closed_x - LAND_X) + (chars(|r| &r.closed) + 9.0) * cw;
+    let lw = l.rows.iter().map(|r| r.label.chars().count()).max().unwrap_or(0) as f32;
+    let lw = lw.max(l.rename.as_ref().map_or(0, |t| t.chars().count() + 1) as f32);
+    let (closed, list_w) = land_metrics(l, cw);
+    let closed_x = LAND_X + closed;
+    // A hairline between the actions (new, running, last) and the saved sessions.
+    if let Some(first) = l.rows.iter().position(|r| r.kind == Kind::Saved) {
+        brush.SetColor(&color(fg(), 0.1));
+        rt.FillRectangle(&rect(LAND_X, LAND_ROWS + first as f32 * lh - 1.0, list_w - 12.0, 1.0), brush);
+    }
+    let mouse = a.mouse;
     for (i, row) in l.rows.iter().enumerate() {
         let y = LAND_ROWS + i as f32 * lh;
         let on = i == l.sel;
+        let (glyph, gcolor) = match row.kind {
+            Kind::New => ("+", theme().ansi[2]),
+            Kind::Live => ("\u{25cf}", theme().ansi[2]),
+            Kind::Last => ("\u{21ba}", theme().ansi[4]),
+            Kind::Saved => ("\u{25aa}", theme().ansi[3]),
+        };
+        line(glyph, LAND_X + 2.0 * cw, y, gcolor, if on { 1.0 } else { 0.6 });
         if on {
             brush.SetColor(&color(fg(), 0.07));
             let bar = D2D1_ROUNDED_RECT { rect: rect(LAND_X - 12.0, y, list_w + 12.0, lh), radiusX: 6.0, radiusY: 6.0 };
             rt.FillRoundedRectangle(&bar, brush);
             line("\u{276f}", LAND_X, y, theme().ansi[2], 1.0);
         }
-        line(&row.label, LAND_X + 2.0 * cw, y, theme().fg, if on { 1.0 } else { 0.6 });
-        line(&row.detail, LAND_X + (4.0 + lw) * cw, y, theme().fg, if on { 0.6 } else { 0.4 });
+        let renaming = on.then_some(l.rename.as_ref()).flatten();
+        if let Some(typed) = renaming {
+            line(&format!("{typed}\u{258f}"), LAND_X + 4.0 * cw, y, theme().ansi[2], 1.0);
+            brush.SetColor(&color(rgb(theme().ansi[2]), 0.5));
+            rt.FillRectangle(&rect(LAND_X + 4.0 * cw, y + lh - 5.0, (typed.chars().count() as f32 + 1.0) * cw, 1.0), brush);
+        } else if on {
+            text(&row.label, &a.bold, rect(LAND_X + 4.0 * cw, y + (lh - ch) / 2.0, 4000.0, ch), theme().fg, 1.0);
+        } else {
+            line(&row.label, LAND_X + 4.0 * cw, y, theme().fg, 0.6);
+        }
+        line(&row.detail, LAND_X + (6.0 + lw) * cw, y, theme().fg, if on { 0.6 } else { 0.4 });
         if row.kind == Kind::Live {
             line("running", closed_x, y, theme().ansi[2], if on { 0.9 } else { 0.6 });
         } else if !row.closed.is_empty() {
             line(&format!("closed {}", row.closed), closed_x, y, theme().fg, if on { 0.5 } else { 0.3 });
         }
+        // Subtle icons on the selected saved session: a pencil to rename, a bin to delete.
+        if on && row.kind == Kind::Saved && l.rename.is_none() {
+            let (ix, iy) = (LAND_X + list_w - 2.0 * ICON_W, y + lh / 2.0);
+            let dot = |c: u32, x: f32, y: f32, w: f32, h: f32, alpha: f32| {
+                brush.SetColor(&color(rgb(c), alpha));
+                rt.FillRectangle(&rect(x.round(), y.round(), w, h), brush);
+            };
+            // Glow under the pointer: brighter, and a faint plate behind the icon.
+            let over = mouse.and_then(|m| (m.1 >= y && m.1 < y + lh).then(|| land_icon(m.0, list_w)).flatten());
+            let plate = |i: f32, c: u32| {
+                brush.SetColor(&color(rgb(c), 0.16));
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: rect(ix + i * ICON_W + 2.0, y + 3.0, ICON_W - 4.0, lh - 6.0), radiusX: 5.0, radiusY: 5.0 }, brush);
+            };
+            let pen_a = if over == Some(false) { 1.0 } else { 0.45 };
+            if over == Some(false) {
+                plate(0.0, theme().ansi[2]);
+            }
+            if over == Some(true) {
+                plate(1.0, theme().ansi[1]);
+            }
+            let bin = if l.armed || over == Some(true) { theme().ansi[1] } else { theme().fg };
+            let alpha = if l.armed || over == Some(true) { 1.0 } else { 0.45 };
+            // Pencil: a stepped diagonal with a tip.
+            let pc = ix + ICON_W / 2.0;
+            for k in 0..6 {
+                let o = k as f32 * 2.0 - 5.0;
+                dot(theme().fg, pc + o, iy - o - 2.0, 3.0, 3.0, pen_a);
+            }
+            dot(theme().fg, pc - 6.0, iy + 4.0, 3.0, 1.0, pen_a);
+            // Bin: handle, lid, sides, bottom.
+            let bc = ix + ICON_W * 1.5;
+            dot(bin, bc - 2.0, iy - 7.0, 5.0, 1.0, alpha);
+            dot(bin, bc - 6.0, iy - 5.0, 13.0, 2.0, alpha);
+            dot(bin, bc - 4.0, iy - 3.0, 1.0, 9.0, alpha);
+            dot(bin, bc + 4.0, iy - 3.0, 1.0, 9.0, alpha);
+            dot(bin, bc - 4.0, iy + 5.0, 9.0, 1.0, alpha);
+        }
     }
 
-    // What the selected choice opens: its layout in miniature, with each pane's name, right of
-    // everything on the left (the list and the hint lines below it).
-    let texts = [&tagline, &keys, &more].iter().map(|t| t.chars().count()).max().unwrap_or(0) as f32;
-    let px = LAND_X + list_w.max(texts * cw) + 48.0;
+    // What the selected choice opens: its layout in miniature, with each pane's name, in a card
+    // right of everything on the left (the list and the lines below it).
+    let px = LAND_X + list_w.max((tagline.chars().count() + 2) as f32 * cw) + 56.0;
     let Some(row) = l.rows.get(l.sel) else { return };
-    if px + PREVIEW.0 <= width - 24.0 {
+    if px + PREVIEW.0 + 16.0 <= width - 24.0 {
+        let card = rect(px - 16.0, LAND_ROWS - 46.0, PREVIEW.0 + 32.0, PREVIEW.1 + 46.0 + 44.0);
+        let card = D2D1_ROUNDED_RECT { rect: card, radiusX: 10.0, radiusY: 10.0 };
+        brush.SetColor(&color(fg(), 0.035));
+        rt.FillRoundedRectangle(&card, brush);
+        brush.SetColor(&color(fg(), 0.09));
+        rt.DrawRoundedRectangle(&card, brush, 1.0, None);
+        text(&row.label, &a.bold, rect(px, LAND_ROWS - 40.0, PREVIEW.0, ch), theme().fg, 0.9);
         let one = Node::Leaf(0);
         let fresh = [SavedPane::default()];
         let (tree, panes) = row.session.as_ref().map_or((&one, &fresh[..]), |s| (&s.tree, &s.panes[..]));
@@ -2008,17 +2154,47 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
         text(&caption,&a.tab, rect(px - 60.0, LAND_ROWS + PREVIEW.1 + 8.0, PREVIEW.0 + 120.0, 24.0), theme().fg, 0.4);
     }
 
-    // Keys, or the delete or leave question.
+    // The rename, delete or leave question, or what went wrong: wrapped to stay left of the card.
     let y = LAND_ROWS + (l.rows.len() as f32 + 1.0) * lh;
-    if l.armed {
-        line(&format!("press Del again to delete \u{201c}{}\u{201d}", row.label), LAND_X, y, theme().ansi[1], 0.9);
+    let (msg, c) = if let Some(n) = l.note {
+        (n.to_string(), theme().ansi[1])
+    } else if l.armed {
+        (format!("press Del again to delete \u{201c}{}\u{201d}", row.label), theme().ansi[1])
+    } else if l.rename.is_some() {
+        ("Enter renames   Esc cancels".to_string(), theme().fg)
     } else if l.leaving {
-        let what = format!("press Enter again to close this session and open \u{201c}{}\u{201d}", row.label);
-        line(&what, LAND_X, y, theme().ansi[3], 0.9);
+        (format!("press Enter again to close this session and open \u{201c}{}\u{201d}", row.label), theme().ansi[3])
     } else {
-        line(&keys, LAND_X, y, theme().fg, 0.4);
+        (String::new(), theme().fg)
+    };
+    if !msg.is_empty() {
+        let room = if px + PREVIEW.0 + 16.0 <= width - 24.0 { px - 40.0 } else { width - 24.0 } - LAND_X;
+        if let Ok(wrap) = text_format(&a.dw, DWRITE_FONT_WEIGHT_NORMAL, FONT_SIZE) {
+            let _ = wrap.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            text(&msg, &wrap, rect(LAND_X, y, room.max(cw * 10.0), ch * 3.0), c, 0.9);
+        }
     }
-    line(&more, LAND_X, y + lh, theme().fg, 0.25);
+
+    // The footer: the keys that drive dterm, the configurable ones as set on the settings page.
+    let mut hints = vec![
+        "\u{2191}\u{2193} choose".to_string(),
+        "Enter open".into(),
+        format!("Esc {}", if live { "back" } else { "new" }),
+        "F2 rename".into(),
+        "Del delete".into(),
+    ];
+    for (act, what) in [(Action::Save, "save session"), (Action::Home, "start page"), (Action::Settings, "settings")] {
+        hints.extend(a.settings.keys[act as usize].map(|k| format!("{} {what}", chord_text(k))));
+    }
+    let top = height - FOOT_H;
+    brush.SetColor(&color(fg(), 0.04));
+    rt.FillRectangle(&rect(0.0, top, width, FOOT_H), brush);
+    brush.SetColor(&color(fg(), 0.08));
+    rt.FillRectangle(&rect(0.0, top, width, 1.0), brush);
+    if let Ok(small) = text_format(&a.dw, DWRITE_FONT_WEIGHT_NORMAL, TAB_SIZE) {
+        let _ = small.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        text(&hints.join("   \u{b7}   "), &small, rect(LAND_X, top, (width - LAND_X - 12.0).max(0.0), FOOT_H), theme().fg, 0.35);
+    }
 }
 
 /// The view button, and in Tabs view the strip with a tab per pane, over the panes.
@@ -2373,44 +2549,69 @@ unsafe fn go_home(hwnd: HWND) {
         let Some(s) = a.session() else { return };
         // The last session is this one now, so it shows up only as the running one.
         let mut rows: Vec<Choice> = rows.into_iter().filter(|r| r.kind != Kind::Last).collect();
-        rows.insert(0, choice("This session".into(), s, None, Kind::Live, &ago));
-        a.landing = Some(Landing { rows, sel: 0, armed: false, leaving: false });
+        rows.insert(1, choice("This session".into(), s, None, Kind::Live, &ago));
+        let mut l = Landing::new(rows);
+        l.sel = 1; // the running session
+        a.landing = Some(l);
         (a.drag, a.select, a.rename, a.prompt) = (None, None, None, None);
     });
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
+/// Start renaming the selected saved session on the landing page, with its name to edit.
+fn start_rename(a: &mut App) {
+    if let Some(l) = a.landing.as_mut().filter(|l| l.saved()) {
+        l.calm();
+        l.rename = Some(l.rows[l.sel].label.clone());
+    }
+}
+
+/// Delete the selected saved session: the first call asks, the second removes the file.
+fn press_delete(a: &mut App) {
+    let Some(l) = a.landing.as_mut().filter(|l| l.saved()) else { return };
+    let ask = !std::mem::replace(&mut l.armed, true);
+    (l.leaving, l.rename, l.note) = (false, None, None);
+    if !ask {
+        l.delete();
+    }
+}
+
 /// Keys on the landing page: ↑↓ choose, Enter opens, Esc opens the first choice (the running
-/// session, else a new one), Del (twice) deletes a saved one.
+/// session, else a new one), F2 renames and Del (twice) deletes a saved one. While a name is
+/// typed, Enter keeps it, Esc drops it, and the other keys edit it.
 unsafe fn landing_key(hwnd: HWND, vk: u16) {
+    if with(|a| a.landing.as_ref().is_some_and(|l| l.rename.is_some())) {
+        with(|a| {
+            let Some(l) = a.landing.as_mut() else { return };
+            match vk {
+                0x0D | 0x1B => {
+                    a.skip_char = true;
+                    let typed = l.rename.take().unwrap_or_default();
+                    l.note = if vk == 0x0D { l.rename_to(&typed).err() } else { None };
+                }
+                0x08 => {
+                    l.rename.as_mut().map(|t| t.pop());
+                }
+                _ => {}
+            }
+        });
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        return;
+    }
     match vk {
         0x26 | 0x28 => with(|a| {
             if let Some(l) = a.landing.as_mut() {
                 l.sel = cycle(l.rows.len(), l.sel, if vk == 0x26 { -1 } else { 1 });
-                (l.armed, l.leaving) = (false, false);
+                l.calm();
             }
         }),
+        0x71 => with(start_rename),
         0x0D | 0x1B => {
             with(|a| a.skip_char = true); // the Enter / Esc character is not for the new shell
-            let i = with(|a| if vk == 0x0D { a.landing.as_ref().map_or(0, |l| l.sel) } else { 0 });
+            let i = with(|a| a.landing.as_ref().map_or(0, |l| if vk == 0x0D { l.sel } else { l.first() }));
             open_choice(hwnd, i);
         }
-        0x2E => with(|a| {
-            let Some(l) = a.landing.as_mut() else { return };
-            if l.rows[l.sel].kind != Kind::Saved {
-                return;
-            }
-            l.leaving = false;
-            if !std::mem::replace(&mut l.armed, true) {
-                return; // the first press only asks
-            }
-            if let Some(f) = &l.rows[l.sel].file {
-                let _ = std::fs::remove_file(f);
-            }
-            l.rows.remove(l.sel);
-            l.sel = l.sel.min(l.rows.len() - 1);
-            l.armed = false;
-        }),
+        0x2E => with(press_delete),
         _ => {}
     }
     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2638,7 +2839,7 @@ unsafe fn on_key(hwnd: HWND, vk: u16, scan: u32) -> bool {
         return mine;
     }
     // A dterm shortcut, unless a name is being typed or AltGr makes a character with this key.
-    let typing = with(|a| a.prompt.is_some() || a.rename.is_some());
+    let typing = with(|a| a.prompt.is_some() || a.rename.is_some() || a.landing.as_ref().is_some_and(|l| l.rename.is_some()));
     let action = with(|a| a.settings.action(chord)).filter(|_| !typing && !altgr_char(vk, scan));
     // The landing page takes every key; Alt chords (Alt+F4) stay with the system. Of the
     // shortcuts, settings and the start page (back to the running session) work there.
@@ -2647,7 +2848,7 @@ unsafe fn on_key(hwnd: HWND, vk: u16, scan: u32) -> bool {
             Some(Action::Settings) => run(hwnd, Action::Settings),
             Some(Action::Home) if with(|a| a.landing.as_ref().is_some_and(|l| l.rows.iter().any(|r| r.kind == Kind::Live))) => {
                 drop_char(hwnd);
-                open_choice(hwnd, 0);
+                open_choice(hwnd, with(|a| a.landing.as_ref().map_or(0, |l| l.first())));
             }
             _ if !alt => landing_key(hwnd, vk),
             _ => return false,
@@ -2846,7 +3047,12 @@ unsafe fn on_char(unit: u16, alt: bool) {
         }
         let units = if (0xDC00..0xE000).contains(&unit) { vec![std::mem::take(&mut a.surrogate), unit] } else { vec![unit] };
         let mut s: String = char::decode_utf16(units).filter_map(|r| r.ok()).collect();
-        if a.landing.is_some() {
+        if let Some(l) = a.landing.as_mut() {
+            if let Some(typed) = l.rename.as_mut() {
+                if !alt && !s.chars().any(char::is_control) && typed.chars().count() < PROMPT_MAX {
+                    typed.push_str(&s);
+                }
+            }
             return;
         }
         if let Some(typed) = a.prompt.as_mut() {
@@ -2991,13 +3197,43 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // The landing page: hovering selects a choice, a click opens it.
         WM_MOUSEMOVE | WM_LBUTTONDOWN if with(|a| a.landing.is_some()) => {
             let m = mouse(hwnd);
-            let row = with(|a| landing_row(m.1, land_line(a.cell.1), a.landing.as_ref().map_or(0, |l| l.rows.len())));
-            if let Some(i) = row {
+            let renaming = with(|a| a.landing.as_ref().is_some_and(|l| l.rename.is_some()));
+            // Only over the list itself: the page around it does nothing.
+            let row = with(|a| {
+                let l = a.landing.as_ref()?;
+                let list_w = land_metrics(l, a.cell.0).1;
+                if !(LAND_X - 12.0..=LAND_X + list_w).contains(&m.0) {
+                    return None;
+                }
+                landing_row(m.1, land_line(a.cell.1), l.rows.len())
+            });
+            if msg == WM_MOUSEMOVE {
+                with(|a| a.mouse = Some(m)); // for the icons' glow
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            if renaming {
+                // A click anywhere while a name is typed keeps it, like Enter.
                 if msg == WM_LBUTTONDOWN {
-                    open_choice(hwnd, i);
-                } else if with(|a| a.landing.as_mut().is_some_and(|l| std::mem::replace(&mut l.sel, i) != i)) {
-                    with(|a| a.landing.as_mut().map(|l| (l.armed, l.leaving) = (false, false)));
+                    landing_key(hwnd, 0x0D);
+                    with(|a| a.skip_char = false); // a click has no Enter character to skip
+                }
+                return LRESULT(0);
+            }
+            if let Some(i) = row {
+                let icon = with(|a| {
+                    let l = a.landing.as_ref()?;
+                    land_icon(m.0, land_metrics(l, a.cell.0).1).filter(|_| l.rows[i].kind == Kind::Saved && l.sel == i)
+                });
+                if msg != WM_LBUTTONDOWN {
+                    if with(|a| a.landing.as_mut().is_some_and(|l| std::mem::replace(&mut l.sel, i) != i)) {
+                        with(|a| a.landing.as_mut().map(|l| l.calm()));
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
+                } else if let Some(delete) = icon {
+                    with(if delete { press_delete } else { start_rename });
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                } else {
+                    open_choice(hwnd, i);
                 }
             }
             return LRESULT(0);
@@ -3252,7 +3488,7 @@ fn main() {
         // With a last or saved session, start on the landing page; otherwise straight in a new one.
         let rows = data_dir().map(|d| landing_rows(&d, &ago)).unwrap_or_default();
         if rows.len() > 1 {
-            with(|a| a.landing = Some(Landing { rows, sel: 0, armed: false, leaving: false }));
+            with(|a| a.landing = Some(Landing::new(rows)));
         } else {
             add_pane(hwnd, None);
             if with(|a| a.panes.is_empty()) {
@@ -3496,6 +3732,35 @@ fn check() {
     assert_eq!(landing_row(LAND_ROWS + 2.0 * 20.0 + 1.0, 20.0, 3), Some(2));
     assert_eq!(landing_row(LAND_ROWS + 3.0 * 20.0 + 1.0, 20.0, 3), None);
     assert_eq!(landing_row(LAND_ROWS - 1.0, 20.0, 3), None);
+    // Landing page icons sit at the right end of the list.
+    assert_eq!(land_icon(LAND_X + 100.0 - 2.0 * ICON_W + 1.0, 100.0), Some(false));
+    assert_eq!(land_icon(LAND_X + 100.0 - ICON_W + 1.0, 100.0), Some(true));
+    assert_eq!(land_icon(LAND_X + 100.0 - 2.0 * ICON_W - 1.0, 100.0), None);
+    assert_eq!(land_icon(LAND_X + 100.0 + 1.0, 100.0), None);
+    // Renaming and deleting saved sessions touches only their files.
+    let dir = std::env::temp_dir().join(format!("dterm-check-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let saved = |name: &str| {
+        let f = dir.join(format!("{name}.session"));
+        std::fs::write(&f, session_text(&parse_session("dterm-session 1\nview grid\nfont 16\nfocus 0\npane a\t\n").unwrap())).unwrap();
+        choice(name.into(), parse_session(&std::fs::read_to_string(&f).unwrap()).unwrap(), Some(f), Kind::Saved, &ago)
+    };
+    let mut rows = vec![landing_rows(&dir, &ago).remove(0)];
+    rows.extend(["alpha", "beta", "gamma"].map(saved));
+    let mut l = Landing::new(rows);
+    l.sel = 0;
+    assert!(!l.saved() && l.rename_to("x").is_err() && !l.delete()); // "New session" is neither
+    l.sel = 2; // beta
+    assert_eq!(l.rename_to("alpha"), Err("a session with that name exists"));
+    assert_eq!(l.rename_to("?:"), Err("a name needs letters or digits"));
+    assert_eq!(l.rename_to("zeta"), Ok(()));
+    assert!(dir.join("zeta.session").exists() && !dir.join("beta.session").exists());
+    assert_eq!((l.rows[l.sel].label.as_str(), l.sel), ("zeta", 3)); // sorted after gamma, still selected
+    assert_eq!(l.rename_to("ZETA"), Ok(())); // only the letter case changes
+    assert!(l.delete() && !dir.join("ZETA.session").exists() && !dir.join("zeta.session").exists());
+    assert_eq!((l.rows.len(), l.sel), (3, 2)); // selection stays on the last row
+    let _ = std::fs::remove_dir_all(&dir);
     // Files from before the timestamps still open, with unknown times.
     let old = parse_session("dterm-session 1\nview grid\nfont 16\nfocus 0\npane C:\\x\t\n").unwrap();
     assert_eq!((old.created, old.closed), (0, 0));

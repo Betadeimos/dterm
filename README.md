@@ -48,7 +48,7 @@ Closing the window (X button, Alt+F4, shutdown) or going to the start page saves
 `%APPDATA%\dterm\last.session`; closing the last pane with `exit` ends dterm without saving. Ctrl+Alt+S saves it under a name in `%APPDATA%\dterm\sessions`.
 When something is saved, dterm starts on a small landing page: pick the last session, a saved
 one (with a preview of its layout and when it was started and closed), or a new one.
-On the landing page, ↑↓ or the mouse choose, Enter or a click opens, Esc opens the first choice, Del (twice) deletes a saved one. Ctrl+Alt+H brings the landing page back while you work: the running session stays first in the
+On the landing page, ↑↓ or the mouse choose, Enter or a click opens, Esc opens the first choice, F2 renames and Del (twice) deletes a saved one (or click the pencil / bin icons on the selected row). A footer bar lists the keys, with your own shortcuts. Ctrl+Alt+H brings the landing page back while you work: the running session stays first in the
 list (Esc returns to it), and opening another one closes it after asking once.
 
 Panes that run [Claude Code](https://claude.com/claude-code) come back inside it: dterm saves
