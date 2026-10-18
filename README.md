@@ -2,101 +2,104 @@
 
 <h1 align="center">dterm</h1>
 
-<p align="center">A tiny Windows terminal that puts your shells in a grid.</p>
+<p align="center"><b>A native Windows terminal that puts all your shells, and your coding agents, in one grid.</b><br>
+One exe under 500 KB. No Electron. No config.</p>
 
 ![dterm with four panes: git log, color test, cargo test and an agent session](assets/screenshot.png)
 
-One native exe (about 490 KB), nothing to configure. Panes run Git Bash and look like Windows
-Terminal: acrylic background (kept when the window isn't focused), One Half Dark colors,
-Cascadia Mono, font fallback for symbols and emoji. Each pane shows a faint name, and sessions
-come back: close dterm and it offers to reopen the same panes in the same folders. A pane that is
-not focused is tinted while it works (blue), when it finishes (green) and when it rings the bell (yellow).
+## Why dterm
 
-## Shortcuts
+- **The grid builds itself.** `Ctrl+Alt+T` splits the largest pane. Press it four times, get a 2x2.
+- **Drag to resize.** Grab any gap between panes and pull. (Windows Terminal has had this
+  [open since 2019](https://github.com/microsoft/terminal/issues/992).)
+- **Grid or Tabs, same sessions.** `Ctrl+Alt+G` flips between them without touching a shell.
+- **Claude Code comes back.** Close dterm, reopen it: every pane returns to its folder, and panes that
+  ran [Claude Code](https://claude.com/claude-code) resume their newest conversation (`claude --resume <id>`).
+- **See which pane needs you.** Background panes tint blue while busy, green when done, yellow on a bell.
+- **Looks like Windows Terminal.** Acrylic that stays on when unfocused, One Half Dark, Cascadia Mono,
+  emoji and symbol fallback, 4 themes.
 
-dterm's own shortcuts use Ctrl+Alt, so Ctrl+Shift combinations reach your shell and apps.
-The ones marked * can be changed on the settings page. AltGr counts as Ctrl+Alt on many
-keyboards; when AltGr+key types a character on your layout (like AltGr+è = `[` on an Italian
-keyboard), that character wins, and left Ctrl + left Alt give the shortcut.
-
-| Keys | Action |
-| --- | --- |
-| Ctrl+Alt+T * | Add a pane (splits the largest one, so the grid builds itself) |
-| Ctrl+Alt+Plus / Ctrl+Alt+Minus *, Alt+Shift+Plus / Minus | Split the focused pane to the right / below |
-| Ctrl+Alt+W *, or `exit` | Close the pane |
-| Ctrl+Alt+R * | Rename the focused pane |
-| Ctrl+Alt+Z * | Zoom the focused pane to the whole window, and back |
-| Ctrl+Alt+G * | Switch between grid and tabs (also the button in the title bar, top-left) |
-| Ctrl+Alt+S * | Save the session: over its file if it has one, else it asks for a name |
-| Ctrl+Alt+H * | Go to the start page (also the ≡ button, top-left); the session keeps running |
-| Ctrl+Alt+Comma * | Settings |
-| Alt+Arrow keys | Move focus to the pane in that direction (in tabs: Left / Right pick the previous / next tab) |
-| Alt+Shift+Arrow keys | Resize the focused pane (grid only) |
-| Ctrl+Alt+Arrow keys | Swap the focused pane with its neighbor (grid only) |
-| Drag a gap between panes | Resize panes |
-| Click a tab | Focus that pane (tabs view) |
-| Ctrl+Tab / Ctrl+Shift+Tab | Next / previous pane or tab |
-| Mouse drag, double / triple click, Shift+Arrow keys | Select text; Ctrl+Shift+Left / Right select by word |
-| Ctrl+C (with a selection), right-click | Copy; right-click without a selection pastes |
-| Ctrl+V / Ctrl+Shift+V | Paste as plain text |
-| Esc | Drop the selection |
-| Mouse wheel | Scroll back through history; apps that ask for the mouse (or use the alternate screen) get the wheel instead. Clicks and drags are never sent to apps |
-| Ctrl+Plus / Ctrl+Minus / Ctrl+0, Ctrl+wheel | Font size |
-
-## Sessions
-
-Closing the window (X button, Alt+F4, shutdown) or going to the start page saves the session (layout, each pane's folder and name, view, font size) to
-`%APPDATA%\dterm\last.session`; closing the last pane with `exit` ends dterm without saving. Ctrl+Alt+S saves it under a name in `%APPDATA%\dterm\sessions`; once it has a name, Ctrl+Alt+S saves over it. A session stays the same session: opening a saved one keeps it open under its name, and saving writes over it.
-When something is saved, dterm starts on a small landing page: pick the last session, a saved
-one (with a preview of its layout and when it was started and closed), or a new one.
-On the landing page, ↑↓ or the mouse choose, Enter or a click opens, Esc opens the first choice, F2 renames and Del (twice) deletes a saved one (or click the pencil / bin icons on the selected row). F2 on the running session saves it as a new session under the new name and leaves the old one as it was. A footer bar lists the keys, with your own shortcuts. Ctrl+Alt+H brings the landing page back while you work: the running session stays first in the
-list under its own name (Esc returns to it), and opening another one closes it after asking once.
-
-Panes that run [Claude Code](https://claude.com/claude-code) come back inside it: dterm saves
-each one's newest conversation and restores it with `claude --resume <id>`.
-
-## Settings
-
-Ctrl+Alt+Comma opens a page in the same style as the landing page: theme (One Half Dark,
-Campbell, Catppuccin Mocha, Dracula), background opacity, and every dterm shortcut (Enter, then
-press the new keys; Del puts back the default). Keyboard only, no mouse. Changes apply at once and are saved to
-`%APPDATA%\dterm\settings`, a small text file you can also edit by hand.
+Native Rust, Direct2D and DirectWrite, ConPTY. Panes run Git Bash.
 
 ## Install
 
 Download `dterm-vX.Y.Z.exe` (or the zip) from [Releases](https://github.com/Betadeimos/dterm/releases)
-and run it. There is no installer: put the exe wherever you like and pin it to the taskbar.
+and run it. No installer: put it anywhere and pin it to the taskbar.
 
-## Requirements
+**Requires** Windows 10 1809+ and [Git for Windows](https://gitforwindows.org/). Windows 11 22H2+ uses the
+system acrylic; Windows 10 gets dterm's own.
 
-- Windows 10 1809 or later. Windows 11 22H2+ gets the system acrylic backdrop; on Windows 10 dterm makes the acrylic itself
-- [Git for Windows](https://gitforwindows.org/) (dterm runs its Git Bash)
+## Build from source
 
-## Build
-
-You need [Rust](https://rustup.rs/) (the MSVC toolchain, which rustup picks by default) and the
-Visual Studio Build Tools with "Desktop development with C++", which provide the linker.
+You need [Rust](https://rustup.rs/) (MSVC toolchain) and Visual Studio Build Tools with
+"Desktop development with C++".
 
 ```
-cargo build --release
+cargo build --release     # target\release\dterm.exe
+cargo test                # unit tests
 ```
 
-The exe is `target\release\dterm.exe`. The icon is linked from the prebuilt `dterm.res`, so the
-build needs no resource compiler. To change it, draw a new one with `assets\icon.ps1`, point
-`dterm.rc` at it and rebuild `dterm.res` (steps in `build.rs`).
+`.\release.ps1` builds `dist\dterm-vX.Y.Z.exe` and a zip; `-Publish` also tags and creates the GitHub
+release (needs the GitHub CLI). Want to help? Read [CONTRIBUTING.md](CONTRIBUTING.md).
 
-`.\release.ps1` builds `dist\dterm-vX.Y.Z.exe` and a zip for the version in `Cargo.toml`;
-`.\release.ps1 -Publish` also tags it and creates the GitHub release (needs the GitHub CLI).
+## Shortcuts
 
-## Pane status
+dterm's own shortcuts use Ctrl+Alt, so Ctrl+Shift combinations reach your shell and apps.
+Rows marked * can be changed on the settings page. AltGr counts as Ctrl+Alt on many keyboards: when
+AltGr+key types a character on your layout, that character wins, and left Ctrl + left Alt give the shortcut.
 
-A pane that is not focused tints its name: blue while output streams, green once it goes quiet,
-yellow after it rings the bell (for example an agent asking for you). Focusing the pane clears it.
-The tint is still subtle; making it easier to see is on the roadmap.
+### Panes and layout
 
-## Status
+| Keys | Action |
+| --- | --- |
+| `Ctrl+Alt+T` * | Add a pane (splits the largest one) |
+| `Ctrl+Alt+Plus` / `Ctrl+Alt+Minus` * | Split the focused pane right / below (also `Alt+Shift+Plus` / `Minus`) |
+| `Ctrl+Alt+W` *, or `exit` | Close the pane |
+| `Ctrl+Alt+R` * | Rename the focused pane |
+| `Ctrl+Alt+Z` * | Zoom the focused pane to the whole window, and back |
+| `Ctrl+Alt+G` * | Switch between Grid and Tabs (or the button, top-left) |
+| `Alt+Arrows` | Move focus (in tabs: Left / Right pick the previous / next tab) |
+| `Alt+Shift+Arrows` | Resize the focused pane (grid) |
+| `Ctrl+Alt+Arrows` | Swap the focused pane with its neighbor (grid) |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous pane or tab |
+| Drag a gap | Resize panes |
 
-Early, but in daily use. See [ROADMAP.md](ROADMAP.md) for what's next, like broadcast input.
+### Sessions and settings
+
+| Keys | Action |
+| --- | --- |
+| `Ctrl+Alt+S` * | Save the session (over its file, or ask for a name the first time) |
+| `Ctrl+Alt+H` * | Start page (also the ≡ button); the session keeps running |
+| `Ctrl+Alt+Comma` * | Settings: theme, opacity, every shortcut |
+
+### Text
+
+| Keys | Action |
+| --- | --- |
+| Mouse drag, double / triple click | Select text |
+| `Shift+Arrows`, `Ctrl+Shift+Left` / `Right` | Select by character / word |
+| `Ctrl+C` (with a selection), right-click | Copy; right-click with no selection pastes |
+| `Ctrl+V` / `Ctrl+Shift+V` | Paste as plain text |
+| `Esc` | Drop the selection |
+| Mouse wheel | Scroll history (apps that ask for the mouse get the wheel) |
+| `Ctrl+Plus` / `Ctrl+Minus` / `Ctrl+0`, `Ctrl+wheel` | Font size |
+
+## Sessions
+
+Closing the window, or going to the start page, saves the layout, each pane's folder and name, the view and the
+font size to `%APPDATA%\dterm\last.session`. `Ctrl+Alt+S` saves it under a name in
+`%APPDATA%\dterm\sessions`, and from then on saves over that file. Closing the last pane with `exit` ends dterm
+without saving.
+
+When something is saved, dterm opens on a start page: last session, a saved one (with a layout preview), or a
+new one. Arrows or mouse choose, Enter opens, `F2` renames, `Del` (twice) deletes.
+
+Settings live in `%APPDATA%\dterm\settings`, a small text file you can also edit by hand.
+
+## Status and roadmap
+
+Early, but in daily use. See [ROADMAP.md](ROADMAP.md): easier-to-see pane status, broadcast input, mouse
+reporting for vim and tmux.
 
 ## License
 
