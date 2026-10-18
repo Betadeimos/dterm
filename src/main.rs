@@ -55,7 +55,7 @@ use windows::{
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
             Ole::CF_UNICODETEXT,
             Registry::*,
-            Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+            Threading::{GetProcessTimes, OpenProcess, Sleep, PROCESS_QUERY_LIMITED_INFORMATION},
             Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
         },
         UI::{Controls::{MARGINS, WM_MOUSELEAVE}, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
@@ -1816,6 +1816,8 @@ unsafe fn add_pane(hwnd: HWND, dir: Option<bool>) {
     });
     if added {
         layout(hwnd);
+    } else if with(|a| !a.panes.is_empty()) {
+        toast(hwnd, "could not start Git Bash".into()); // with no panes, the callers say so
     }
 }
 
@@ -2047,18 +2049,14 @@ unsafe fn paint(hwnd: HWND) {
             rt.Clear(Some(&color(bg(), a.settings.opacity)));
             draw_settings(a, page, rt, brush);
             draw_caption(a, rt, brush, w as f32 / s, zoomed);
-            if rt.EndDraw(None, None).is_err() {
-                a.target = None;
-            }
+            end_draw(hwnd, &mut a.target);
             return;
         }
         if let Some(l) = &a.landing {
             rt.Clear(Some(&color(bg(), a.settings.opacity)));
             draw_landing(a, l, rt, brush, (w as f32 / s, h as f32 / s - CAPTION_H));
             draw_caption(a, rt, brush, w as f32 / s, zoomed);
-            if rt.EndDraw(None, None).is_err() {
-                a.target = None;
-            }
+            end_draw(hwnd, &mut a.target);
             return;
         }
         rt.Clear(Some(&color(rgb(theme().gap), 0.9)));
@@ -2109,10 +2107,17 @@ unsafe fn paint(hwnd: HWND) {
             rt.DrawText(&units, &a.tab, &r, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
         }
         draw_caption(a, rt, brush, w as f32 / s, zoomed);
-        if rt.EndDraw(None, None).is_err() {
-            a.target = None; // device lost: recreate on the next paint
-        }
+        end_draw(hwnd, &mut a.target);
     });
+}
+
+/// Finish the frame. A lost device drops the target and asks for another paint, which makes a new
+/// one: BeginPaint already validated the window, so nothing else would repaint it.
+unsafe fn end_draw(hwnd: HWND, target: &mut Option<(ID2D1HwndRenderTarget, ID2D1SolidColorBrush)>) {
+    if target.as_ref().is_some_and(|(rt, _)| rt.EndDraw(None, None).is_err()) {
+        *target = None;
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
 }
 
 /// The landing page, terminal style: the logo, the choices (the selected one bright with a green
@@ -2445,8 +2450,19 @@ unsafe fn draw_term(
     flush(&mut run, run_at, run_style);
 }
 
+/// Open the clipboard, retrying for a moment: clipboard managers and RDP hold it for a few ms.
+unsafe fn open_clipboard(hwnd: HWND) -> bool {
+    for _ in 0..5 {
+        if OpenClipboard(Some(hwnd)).is_ok() {
+            return true;
+        }
+        Sleep(10);
+    }
+    false
+}
+
 unsafe fn clipboard_text(hwnd: HWND) -> Option<String> {
-    OpenClipboard(Some(hwnd)).ok()?;
+    open_clipboard(hwnd).then_some(())?;
     let text = (|| {
         let h = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
         let p = GlobalLock(HGLOBAL(h.0)) as *const u16;
@@ -2463,7 +2479,7 @@ unsafe fn clipboard_text(hwnd: HWND) -> Option<String> {
 }
 
 unsafe fn set_clipboard_text(hwnd: HWND, text: &str) {
-    if OpenClipboard(Some(hwnd)).is_err() {
+    if !open_clipboard(hwnd) {
         return;
     }
     let _ = EmptyClipboard();
@@ -2546,8 +2562,13 @@ unsafe fn set_font(hwnd: HWND, size: f32) {
 }
 
 /// Write `s` to `file`. False when writing failed.
+/// It goes to a file beside it first and is then moved over it, so a crash mid-write never
+/// leaves a cut-short session behind.
 fn write_session(file: &std::path::Path, s: &Session) -> bool {
-    file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::write(file, session_text(s)).is_ok()
+    let tmp = file.with_extension("tmp");
+    file.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+        && std::fs::write(&tmp, session_text(s)).is_ok()
+        && std::fs::rename(&tmp, file).is_ok()
 }
 
 /// Write the current session to `file`. False when there is nothing to save or writing failed.
@@ -3335,7 +3356,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Always draw the frame as active: Windows otherwise swaps the acrylic for a flat color
         // whenever another window has the focus.
         WM_NCACTIVATE => return DefWindowProcW(hwnd, msg, WPARAM(1), lp),
-        WM_SIZE => layout(hwnd),
+        // Minimized, the client area is 0x0: refitting would squeeze every shell to 2x1.
+        WM_SIZE if wp.0 != SIZE_MINIMIZED as usize => layout(hwnd),
+        // Moved to a monitor with another scale: take the size Windows suggests and draw at the new DPI.
+        WM_DPICHANGED => {
+            let r = *(lp.0 as *const RECT);
+            with(|a| a.target = None);
+            let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+            let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
+            layout(hwnd);
+            return LRESULT(0);
+        }
         // dterm draws its own caption, so the system one goes. Windows 11 keeps the rest of its
         // frame (rounded corners, shadow, resize borders), like Windows Terminal. Windows 10 drops
         // it all: its invisible resize borders would show the acrylic as a halo.
