@@ -20,9 +20,10 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
+    time::Instant,
 };
 
 use alacritty_terminal::{
@@ -168,6 +169,11 @@ const ICON_W: f32 = 28.0; // DIPs, width of a landing row's rename or delete ico
 const FOOT_H: f32 = 30.0; // DIPs, the landing page's footer bar
 const PROMPT_MAX: usize = 40; // characters of a typed session name
 const TOAST_TIMER: usize = 1; // hides the "saved" note
+const STATUS_TIMER: usize = 2; // runs while a pane is busy, to notice when it goes quiet
+const BUSY_MS: u64 = 1500; // output within this long ago counts as busy
+const STATUS_TICK: u32 = 400; // ms between checks while a pane is busy
+const STATUS_ALPHA: f32 = 0.75; // tinted name of a background pane that is done or wants you
+const BUSY_ALPHA: f32 = 0.55; // ... and of one that is busy
 
 fn rgb(c: u32) -> Rgb {
     Rgb { r: (c >> 16) as u8, g: (c >> 8) as u8, b: c as u8 }
@@ -1265,6 +1271,50 @@ fn window_title(name: Option<&str>) -> String {
     name.map_or("dterm".into(), |n| format!("dterm \u{2014} {n}"))
 }
 
+/// What a pane that is not focused has been up to. Focusing it clears the state.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+enum Status {
+    #[default]
+    Idle,
+    Busy,      // output is streaming
+    Done,      // was busy, then went quiet
+    Attention, // it rang the bell
+}
+
+/// Written by a pane's PTY thread, read by the window.
+#[derive(Default)]
+struct Activity {
+    output: AtomicU64, // `uptime()` of the last output, plus one; 0 = none yet
+    bell: AtomicBool,
+}
+
+fn uptime() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// The next status of a pane. `quiet` is the time since its last output, if it ever had any.
+fn next_status(now: Status, focused: bool, bell: bool, quiet: Option<u64>) -> Status {
+    match (now, focused, bell) {
+        (_, true, _) => Status::Idle,
+        (_, _, true) | (Status::Attention, _, _) => Status::Attention,
+        _ if quiet.is_some_and(|q| q < BUSY_MS) => Status::Busy,
+        (Status::Busy | Status::Done, _, _) => Status::Done,
+        _ => Status::Idle,
+    }
+}
+
+/// The color that tints a pane's name for a status: blue busy, green done, yellow waiting.
+fn status_tint(s: Status) -> Option<(Rgb, f32)> {
+    let t = &theme().ansi;
+    match s {
+        Status::Idle => None,
+        Status::Busy => Some((rgb(t[4]), BUSY_ALPHA)),
+        Status::Done => Some((rgb(t[2]), STATUS_ALPHA)),
+        Status::Attention => Some((rgb(t[3]), STATUS_ALPHA)),
+    }
+}
+
 /// Forwards terminal events from a pane's PTY thread to the window.
 #[derive(Clone)]
 struct Proxy {
@@ -1272,6 +1322,7 @@ struct Proxy {
     id: usize,
     tx: Arc<OnceLock<EventLoopSender>>, // set right after the event loop exists
     names: Arc<Mutex<Names>>,
+    activity: Arc<Activity>,
 }
 
 impl EventListener for Proxy {
@@ -1286,7 +1337,14 @@ impl EventListener for Proxy {
             post(WM_WAKE, 0);
         };
         match e {
-            Event::Wakeup => post(WM_WAKE, 0),
+            Event::Wakeup => {
+                self.activity.output.store(uptime() + 1, Ordering::Relaxed);
+                post(WM_WAKE, 0);
+            }
+            Event::Bell => {
+                self.activity.bell.store(true, Ordering::Relaxed);
+                post(WM_WAKE, 0);
+            }
             Event::Title(t) => title(Some(&t)),
             Event::ResetTitle => title(None),
             Event::ChildExit(_) | Event::Exit => post(WM_EXIT, self.id),
@@ -1312,6 +1370,8 @@ struct Pane {
     names: Arc<Mutex<Names>>,   // filled from window titles
     custom: Option<String>,     // name the user typed
     pid: Option<u32>,           // the shell's process
+    activity: Arc<Activity>,
+    status: Status,             // shown while the pane is not focused
 }
 
 impl Pane {
@@ -1341,6 +1401,17 @@ impl Pane {
     /// Grid point and cell half under `m` (client DIPs); `term` is this pane's locked terminal.
     fn point_at(&self, term: &Term<Proxy>, m: (f32, f32), cell: (f32, f32)) -> (Point, Side) {
         locate(m, self.origin, cell, self.size, term.grid().display_offset())
+    }
+
+    /// Re-reads the activity; true if the status changed. A bell on the focused pane is dropped.
+    fn refresh_status(&mut self, focused: bool, now: u64) -> bool {
+        let bell = !focused && self.activity.bell.load(Ordering::Relaxed);
+        if focused {
+            self.activity.bell.store(false, Ordering::Relaxed);
+        }
+        let quiet = self.activity.output.load(Ordering::Relaxed).checked_sub(1).map(|t| now.saturating_sub(t));
+        let next = next_status(self.status, focused, bell, quiet);
+        std::mem::replace(&mut self.status, next) != next
     }
 
     /// The pane's label, if it has a name yet.
@@ -1445,6 +1516,12 @@ impl App {
     /// Whether pane `i` is on screen. Only these take part in mouse hit-testing.
     fn is_shown(&self, i: usize) -> bool {
         self.view == View::Grid || i == self.focus
+    }
+
+    /// Updates every pane's status; true if any changed. Focusing a pane clears its status.
+    fn refresh_status(&mut self) -> bool {
+        let (now, focus) = (uptime(), self.focus);
+        self.panes.iter_mut().enumerate().fold(false, |c, (i, p)| p.refresh_status(i == focus, now) | c)
     }
 
     /// Pane ids in tree order, which is also the tab order.
@@ -1624,13 +1701,14 @@ fn spawn(hwnd: HWND, id: usize, bash: &str, cell: (f32, f32), scale: f32, dir: O
     let pid = pty.child_watcher().pid().map(|p| p.get());
     let slot = Arc::new(OnceLock::new());
     let names = Arc::new(Mutex::new(Names::default()));
-    let proxy = Proxy { hwnd: hwnd.0 as isize, id, tx: slot.clone(), names: names.clone() };
+    let activity = Arc::new(Activity::default());
+    let proxy = Proxy { hwnd: hwnd.0 as isize, id, tx: slot.clone(), names: names.clone(), activity: activity.clone() };
     let term = Arc::new(FairMutex::new(Term::new(Config::default(), &TermSize::new(size.0, size.1), proxy.clone())));
     let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)?;
     let tx = event_loop.channel();
     let _ = slot.set(tx.clone());
     event_loop.spawn();
-    Ok(Pane { id, term, tx, size, rect: (0.0, 0.0, 0.0, 0.0), origin: (PAD, PAD), head: None, names, custom: None, pid })
+    Ok(Pane { id, term, tx, size, rect: (0.0, 0.0, 0.0, 0.0), origin: (PAD, PAD), head: None, names, custom: None, pid, activity, status: Status::Idle })
 }
 
 unsafe fn scale(hwnd: HWND) -> f32 {
@@ -1992,7 +2070,8 @@ unsafe fn paint(hwnd: HWND) {
                     Some((_, typed)) => (format!("{typed}\u{258f}"), 1.0), // the name being typed, with a caret
                     None => (p.name(a.home.as_deref()).unwrap_or_default(), if focused { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }),
                 };
-                brush.SetColor(&color(fg(), alpha));
+                let (tint, alpha) = status_tint(p.status).filter(|_| a.rename.is_none()).unwrap_or((fg(), alpha));
+                brush.SetColor(&color(tint, alpha));
                 let units: Vec<u16> = text.encode_utf16().collect();
                 let slot = rect(x + PAD, y, pw - 2.0 * PAD, LABEL_TOP);
                 rt.DrawText(&units, &a.label, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
@@ -2225,7 +2304,8 @@ unsafe fn draw_chrome(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCol
                 }
             };
             let (x, room) = (n as f32 * tw + TAB_PAD, (tw - 2.0 * TAB_PAD).max(0.0));
-            brush.SetColor(&color(fg(), alpha));
+            let (tint, alpha) = status_tint(p.status).filter(|_| a.rename.is_none()).unwrap_or((fg(), alpha));
+            brush.SetColor(&color(tint, alpha));
             let units: Vec<u16> = text.encode_utf16().collect();
             rt.DrawText(&units, &a.tab, &rect(x, 0.0, room, TAB_H), brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
             if active {
@@ -3117,9 +3197,23 @@ unsafe fn wheel(hwnd: HWND, m: (f32, f32), delta: i32) {
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
+/// Refreshes the pane statuses and runs the timer only while one is busy.
+unsafe fn sync_status(hwnd: HWND) {
+    let (changed, busy) = with(|a| (a.refresh_status(), a.panes.iter().any(|p| p.status == Status::Busy)));
+    if busy {
+        SetTimer(Some(hwnd), STATUS_TIMER, STATUS_TICK, None);
+    } else {
+        let _ = KillTimer(Some(hwnd), STATUS_TIMER);
+    }
+    if changed {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_WAKE => {
+            sync_status(hwnd);
             let _ = InvalidateRect(Some(hwnd), None, false);
             return LRESULT(0);
         }
@@ -3130,6 +3224,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             BeginPaint(hwnd, &mut ps);
+            with(|a| a.refresh_status()); // a focus change clears its pane
             paint(hwnd);
             let _ = EndPaint(hwnd, &ps);
             update_title(hwnd); // focus or names may have changed
@@ -3186,6 +3281,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Closing the window (not the last pane exiting) remembers the session.
         WM_CLOSE => save_last(),
         WM_ENDSESSION if wp.0 != 0 => save_last(),
+        WM_TIMER if wp.0 == STATUS_TIMER => {
+            sync_status(hwnd);
+            return LRESULT(0);
+        }
         WM_TIMER if wp.0 == TOAST_TIMER => {
             let _ = KillTimer(Some(hwnd), TOAST_TIMER);
             with(|a| a.toast = None);
@@ -3523,6 +3622,18 @@ fn check() {
     assert_eq!(key_seq(0x41, false, false, false, false), None);
     assert_eq!(paste_text("a\r\nb\nc", false), "a\rb\rc");
     assert_eq!(paste_text("x\x1b[201~y", true), "\x1b[200~x[201~y\x1b[201~");
+    // Pane status: busy while output is fresh, done once it stops, waiting after a bell; focus clears it.
+    use Status::*;
+    assert_eq!(next_status(Idle, false, false, Some(100)), Busy);
+    assert_eq!(next_status(Busy, false, false, Some(BUSY_MS)), Done);
+    assert_eq!(next_status(Done, false, false, Some(BUSY_MS + 1)), Done);
+    assert_eq!(next_status(Done, false, false, Some(10)), Busy);
+    assert_eq!(next_status(Idle, false, false, None), Idle);
+    assert_eq!(next_status(Idle, false, false, Some(BUSY_MS + 1)), Idle); // old output is not news
+    assert_eq!(next_status(Busy, false, true, Some(10)), Attention);
+    assert_eq!(next_status(Attention, false, false, Some(10)), Attention); // sticks through output
+    assert_eq!(next_status(Attention, true, false, Some(10)), Idle);
+    assert_eq!(next_status(Done, true, true, None), Idle);
     // Text area: PAD all round, or a taller top margin where the name label sits.
     let pane = (10.0, 20.0, 1000.0, 600.0);
     assert_eq!(inner(pane, false), ((18.0, 28.0), (984.0, 584.0)));
