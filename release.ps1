@@ -25,7 +25,7 @@ Write-Host "built dist\$name.exe and dist\$name.zip"
 if ($Publish) {
     if (git status --porcelain) { throw 'commit your changes first' }
     $gh = (Get-Command gh -ErrorAction SilentlyContinue).Source
-    if (-not $gh) { $gh = "$env:LOCALAPPDATA\Programs\gh\bin\gh.exe" } # the portable GitHub CLI
+    if (-not $gh) { $gh = "$env:ProgramFiles\GitHub CLI\gh.exe" } # the installed GitHub CLI
     git tag "v$version"
     git push origin "v$version"
     if ($LASTEXITCODE) { throw 'pushing the tag failed' }
