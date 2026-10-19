@@ -42,7 +42,8 @@
 - **Looks like Windows Terminal.** Acrylic that stays on when unfocused, One Half Dark, Cascadia Mono,
   emoji and symbol fallback, 5 themes (One Half Light among them).
 
-Native Rust, Direct2D and DirectWrite, ConPTY. Panes run Git Bash.
+Native Rust, Direct2D and DirectWrite, ConPTY. Panes run Windows PowerShell; the settings page
+switches new panes to PowerShell 7, Command Prompt or Git Bash, whichever are installed.
 
 ### Why dterm vs. heavy agent IDEs?
 
@@ -59,7 +60,8 @@ Native Rust, Direct2D and DirectWrite, ConPTY. Panes run Git Bash.
 Download `dterm-vX.Y.Z.exe` (or the zip) from [Releases](https://github.com/Betadeimos/dterm/releases)
 and run it. No installer: put it anywhere and pin it to the taskbar.
 
-**Requires** Windows 10 1809+ and [Git for Windows](https://gitforwindows.org/). Windows 11 22H2+ uses the
+**Requires** Windows 10 1809+. [Git for Windows](https://gitforwindows.org/) is optional: it adds Git Bash
+and the worktree shortcut. Windows 11 22H2+ uses the
 system acrylic; Windows 10 gets dterm's own.
 
 ## Build from source
@@ -105,7 +107,7 @@ AltGr+key types a character on your layout, that character wins, and left Ctrl +
 | --- | --- |
 | `Ctrl+Alt+S` * | Save the session (over its file, or ask for a name the first time) |
 | `Ctrl+Alt+H` * | Start page (also the ≡ button); the session keeps running |
-| `Ctrl+Alt+Comma` * | Settings: theme, opacity, every shortcut (keys or mouse: click, wheel, right-click resets a shortcut) |
+| `Ctrl+Alt+Comma` * | Settings: theme, opacity, shell, every shortcut (keys or mouse: click, wheel, right-click resets a shortcut) |
 
 ### Text
 

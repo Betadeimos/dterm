@@ -5,13 +5,14 @@ Thanks for helping. dterm is small on purpose: one native exe, few dependencies,
 ## Build and test
 
 Windows only. You need [Rust](https://rustup.rs/) (MSVC toolchain), Visual Studio Build Tools with
-"Desktop development with C++", and [Git for Windows](https://gitforwindows.org/) (panes run its `bash.exe`).
+"Desktop development with C++". [Git for Windows](https://gitforwindows.org/) is needed for the Git Bash
+test below and the worktree tests.
 
 ```
 cargo build --release          # target\release\dterm.exe
 cargo run                      # debug build, quick to iterate
 cargo test                     # pure-logic unit tests, no window
-cargo test -- --ignored        # also starts Git Bash and types into it
+cargo test -- --ignored        # also starts PowerShell and Git Bash and types into them
 ```
 
 The icon is linked from the prebuilt `dterm.res`, so no resource compiler is needed (see `build.rs` to change it).
@@ -31,7 +32,8 @@ Everything is in `src/main.rs` (about 4000 lines) on purpose, for now. Rough map
 | `Action`, `ACTIONS`, `Chord`, `Settings` | Rebindable shortcuts, settings file parse/write |
 | `Session`, `SavedPane`, `Landing` | Session files, the start page model |
 | `Names`, `Status`, `Activity` | Pane names from OSC titles, busy/done/waiting status |
-| `Signal`, `OscScan`, `Tapped` | OSC 9 / 777 / 133 read from the raw PTY output, feeding `Activity` |
+| `Signal`, `OscScan`, `Tapped` | OSC 9 / 777 / 133 read from the raw PTY output, feeding `Activity`; OSC 9;9 folders feeding `Names` |
+| `Shell`, `shells`, `PS_HOOK` | The shells found on the machine; PowerShell's prompt hook that reports the folder |
 | `Proxy`, `Pane`, `spawn` | One shell: PTY, terminal state, event bridge |
 | `descendant`, `agent`, `agent_run` | Finds claude, codex, opencode or aider under a pane's shell, to tag the pane and resume the agent |
 | `git`, `open_worktree` | The worktree pane shortcut |
@@ -48,7 +50,8 @@ Everything is in `src/main.rs` (about 4000 lines) on purpose, for now. Rough map
 struct in a thread-local; `with(|a| ...)` borrows it. Never call anything inside `with` that sends a message back
 to `wndproc`: it would borrow twice.
 
-**PTY.** `spawn` starts `bash --login -i` through `alacritty_terminal`'s `tty` (ConPTY on Windows). Its
+**PTY.** `spawn` starts the chosen `Shell` (Windows PowerShell by default, with `PS_HOOK` so each prompt sends
+its folder as OSC 9;9; Git Bash as `bash --login -i`) through `alacritty_terminal`'s `tty` (ConPTY on Windows). Its
 `EventLoop` thread reads the shell's output and updates a `Term` behind a `FairMutex`. Each pane's `Proxy` receives
 terminal events (wakeup, bell, title, exit, replies to the app) and turns them into `PostMessageW` calls to the UI
 thread (`WM_WAKE`, `WM_EXIT`) or writes back to the PTY. Status flags (`Activity`) are shared atomics, so the PTY

@@ -1,12 +1,13 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
-//! dterm: Git Bash panes in a tree of splits, drawn with Direct2D/DirectWrite on an acrylic window.
-//! Terminal emulation and ConPTY come from alacritty_terminal.
+//! dterm: shell panes in a tree of splits, drawn with Direct2D/DirectWrite on an acrylic window.
+//! Terminal emulation and ConPTY come from alacritty_terminal. Panes run Windows PowerShell, or
+//! the shell picked on the settings page (PowerShell 7, Command Prompt, Git Bash, if installed).
 //! Shortcuts (the defaults; the settings page changes them): Ctrl+Alt+T splits the largest pane,
 //! Ctrl+Alt+Plus / Ctrl+Alt+Minus (or Alt+Shift+Plus / Minus, as in Windows Terminal) split the
 //! focused one side by side / top and bottom, Ctrl+Alt+W (or `exit`) closes a pane, Ctrl+Alt+R
 //! renames it (Enter confirms, Esc cancels, empty resets), Ctrl+Alt+Z zooms it to the whole window,
 //! Ctrl+Alt+G shows the panes as tabs (also the button in the title bar), Ctrl+Alt+S saves the
-//! session under a name, Ctrl+Alt+H goes to the start page (the ≡ button next to it) and Ctrl+Alt+Comma opens the settings (theme, opacity, shortcuts;
+//! session under a name, Ctrl+Alt+H goes to the start page (the ≡ button next to it) and Ctrl+Alt+Comma opens the settings (theme, opacity, shell, shortcuts;
 //! keys or mouse). Ctrl+Alt+B broadcasts typing and pastes to every pane (Esc or Ctrl+Alt+B stops), Ctrl+Alt+N asks for a
 //! branch and opens a git worktree of the focused pane's repo (`../<repo>-<branch>`) in a new pane.
 //! AltGr+key still types its character where the keyboard layout has one.
@@ -750,12 +751,13 @@ const MIN_OPACITY: f32 = 0.2;
 struct Settings {
     theme: usize,
     opacity: f32,
+    shell: String, // a `Shell` name; one not installed here means the first shell
     keys: [Option<Chord>; ACTIONS.len()],
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { theme: 0, opacity: OPACITY, keys: ACTIONS.map(|a| parse_chord(a.3)) }
+        Settings { theme: 0, opacity: OPACITY, shell: DEFAULT_SHELL.into(), keys: ACTIONS.map(|a| parse_chord(a.3)) }
     }
 }
 
@@ -773,9 +775,10 @@ impl Settings {
     }
 }
 
-/// Settings file text: `theme <name>`, `opacity <percent>`, then `key <action id> <keys or none>`.
+/// Settings file text: `theme <name>`, `opacity <percent>`, `shell <name>`, then
+/// `key <action id> <keys or none>`.
 fn settings_text(s: &Settings) -> String {
-    let mut out = format!("dterm-settings 1\ntheme {}\nopacity {}\n", THEMES[s.theme].name, (s.opacity * 100.0).round());
+    let mut out = format!("dterm-settings 1\ntheme {}\nopacity {}\nshell {}\n", THEMES[s.theme].name, (s.opacity * 100.0).round(), s.shell);
     for (a, k) in ACTIONS.iter().zip(s.keys) {
         out.push_str(&format!("key {} {}\n", a.1, k.map_or("none".into(), chord_text)));
     }
@@ -791,6 +794,8 @@ fn parse_settings(text: &str) -> Settings {
             s.theme = THEMES.iter().position(|t| t.name.eq_ignore_ascii_case(name.trim())).unwrap_or(s.theme);
         } else if let Some(v) = line.strip_prefix("opacity ") {
             s.opacity = v.trim().parse::<f32>().map_or(s.opacity, |v| (v / 100.0).clamp(MIN_OPACITY, 1.0));
+        } else if let Some(name) = line.strip_prefix("shell ").map(str::trim).filter(|n| !n.is_empty()) {
+            s.shell = name.into();
         } else if let Some((id, keys)) = line.strip_prefix("key ").and_then(|r| r.split_once(' ')) {
             if let Some(i) = ACTIONS.iter().position(|a| a.1 == id) {
                 s.keys[i] = parse_chord(keys);
@@ -1296,11 +1301,19 @@ fn folder_name(msys: &str, win: Option<&str>, home: Option<&str>) -> String {
 #[derive(Default)]
 struct Names {
     app: Option<String>, // title set by the running app
-    cwd: Option<String>, // directory Git Bash reported, e.g. `/c/Users/x`
+    cwd: Option<String>, // directory the shell reported: Git Bash's `/c/Users/x`, PowerShell's `C:\Users\x`
     win: Option<String>, // the same as a Windows path (kept for session restore)
 }
 
 impl Names {
+    /// The folder a PowerShell prompt reported (OSC 9;9): like a Git Bash prompt title, it ends
+    /// any app title.
+    fn set_dir(&mut self, dir: &str) {
+        self.app = None;
+        self.cwd = Some(dir.into());
+        self.win = Some(dir.into());
+    }
+
     /// A new title (`None` = reset). A Git Bash prompt title only reports the directory and ends
     /// any app title; every other title belongs to the app.
     fn set_title(&mut self, title: Option<&str>) {
@@ -1405,8 +1418,15 @@ fn osc_signal(p: &[u8]) -> Option<Signal> {
     }
 }
 
-/// Finds OSC sequences in a pane's raw output, also when one is split across reads. Only the
-/// start of each payload is kept: enough to tell the signals apart.
+/// The folder in ConEmu's OSC 9;9 payload (`9;9;C:\x`, quoted or not), which dterm's
+/// PowerShell prompt sends.
+fn osc_cwd(p: &[u8]) -> Option<String> {
+    let dir = String::from_utf8_lossy(p.strip_prefix(b"9;9;")?).trim_matches('"').to_string();
+    (!dir.is_empty()).then_some(dir)
+}
+
+/// Finds OSC sequences in a pane's raw output, also when one is split across reads, and hands
+/// over each payload. Only its start is kept: enough for the signals and a folder.
 #[derive(Default)]
 struct OscScan {
     state: u8, // 0 text, 1 after ESC, 2 in an OSC, 3 after ESC in an OSC
@@ -1414,17 +1434,17 @@ struct OscScan {
 }
 
 impl OscScan {
-    fn feed(&mut self, bytes: &[u8], mut f: impl FnMut(Signal)) {
+    fn feed(&mut self, bytes: &[u8], mut f: impl FnMut(&[u8])) {
         for &b in bytes {
             self.state = match (self.state, b) {
                 (2 | 3, 0x07) | (3, b'\\') => {
-                    osc_signal(&self.buf).map(&mut f);
+                    f(&self.buf);
                     0
                 }
                 (2, 0x1b) => 3,
                 (2, 0x18 | 0x1a) => 0, // CAN, SUB abort it
                 (2, _) => {
-                    if self.buf.len() < 32 {
+                    if self.buf.len() < 1024 {
                         self.buf.push(b);
                     }
                     2
@@ -1447,13 +1467,21 @@ struct Tapped {
     scan: OscScan,
     ran: bool, // see `Activity::signal`
     activity: Arc<Activity>,
+    names: Arc<Mutex<Names>>,
 }
 
 impl std::io::Read for Tapped {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = tty::EventedReadWrite::reader(&mut self.pty).read(buf)?;
-        let (activity, ran) = (&self.activity, &mut self.ran);
-        self.scan.feed(&buf[..n], |s| activity.signal(s, ran));
+        let (activity, ran, names) = (&self.activity, &mut self.ran, &self.names);
+        self.scan.feed(&buf[..n], |p| {
+            if let Some(s) = osc_signal(p) {
+                activity.signal(s, ran);
+            }
+            if let (Some(dir), Ok(mut n)) = (osc_cwd(p), names.lock()) {
+                n.set_dir(&dir);
+            }
+        });
         Ok(n)
     }
 }
@@ -1699,7 +1727,7 @@ struct App {
     font_size: f32,           // DIPs
     cell: (f32, f32), // DIPs
     target: Option<(ID2D1HwndRenderTarget, ID2D1SolidColorBrush)>,
-    bash: String,
+    shells: Vec<Shell>, // installed here, never empty; settings.shell picks one
     panes: Vec<Pane>, // storage; the tree refers to them by id
     focus: usize,     // index into panes
     next_id: usize,
@@ -1735,7 +1763,7 @@ enum Ask {
     Worktree,
 }
 
-/// The settings page: the selected row (theme, opacity, then one per action) and whether it waits
+/// The settings page: the selected row (theme, opacity, shell, then one per action) and whether it waits
 /// for the new keys of the selected action.
 struct SettingsPage {
     sel: usize,
@@ -1743,6 +1771,11 @@ struct SettingsPage {
 }
 
 impl App {
+    /// The shell new panes run.
+    fn shell(&self) -> &Shell {
+        pick_shell(&self.shells, &self.settings.shell)
+    }
+
     /// Whether panes reserve a label slot: with several panes, or while a lone one is renamed.
     /// A zoomed pane counts as a lone one; in Tabs the names are in the strip.
     fn labeled(&self) -> bool {
@@ -1844,6 +1877,45 @@ unsafe fn git_bash() -> String {
         }
     }
     "C:\\Program Files\\Git\\bin\\bash.exe".into()
+}
+
+/// A shell the panes can run: its name on the settings page, its program and arguments.
+#[derive(Clone, Debug, PartialEq)]
+struct Shell {
+    name: &'static str,
+    exe: String,
+    args: Vec<String>,
+}
+
+/// Every Windows has it, so a fresh install starts in it.
+const DEFAULT_SHELL: &str = "Windows PowerShell";
+
+/// Run by PowerShell at start: before each prompt, report the folder with ConEmu's OSC 9;9 (see
+/// `osc_cwd`) so the pane is named after it and comes back in it. The profile's prompt is kept.
+/// No double quotes: they would not survive the command line.
+const PS_HOOK: &str = "$global:dterm_prompt=$function:prompt;function global:prompt{$p=& $global:dterm_prompt;if($PWD.Provider.Name -eq 'FileSystem'){-join([char]27,']9;9;',$PWD.ProviderPath,[char]7,$p)}else{$p}}";
+
+/// The shells installed here, the default first: Windows PowerShell, PowerShell 7, Command
+/// Prompt, Git Bash.
+unsafe fn shells() -> Vec<Shell> {
+    let sys = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    let programs = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
+    let ps: Vec<String> = ["-NoLogo", "-NoExit", "-Command", PS_HOOK].map(Into::into).to_vec();
+    [
+        (DEFAULT_SHELL, format!("{sys}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"), ps.clone()),
+        ("PowerShell 7", format!("{programs}\\PowerShell\\7\\pwsh.exe"), ps),
+        ("Command Prompt", format!("{sys}\\System32\\cmd.exe"), Vec::new()),
+        ("Git Bash", git_bash(), vec!["--login".into(), "-i".into()]),
+    ]
+    .into_iter()
+    .filter(|(_, exe, _)| std::path::Path::new(exe).exists())
+    .map(|(name, exe, args)| Shell { name, exe, args })
+    .collect()
+}
+
+/// The shell called `name` in `shells`, else the first one.
+fn pick_shell<'a>(shells: &'a [Shell], name: &str) -> &'a Shell {
+    shells.iter().find(|s| s.name.eq_ignore_ascii_case(name)).unwrap_or(&shells[0])
 }
 
 /// (pid, parent pid, exe name) of every running process.
@@ -1965,22 +2037,22 @@ fn window_size((cols, lines): (usize, usize), cell: (f32, f32), scale: f32) -> W
     }
 }
 
-/// A new pane running Git Bash in folder `dir` (the home folder when `None` or gone).
-fn spawn(hwnd: HWND, id: usize, bash: &str, cell: (f32, f32), scale: f32, dir: Option<&str>) -> std::io::Result<Pane> {
+/// A new pane running `shell` in folder `dir` (the home folder when `None` or gone).
+fn spawn(hwnd: HWND, id: usize, shell: &Shell, cell: (f32, f32), scale: f32, dir: Option<&str>) -> std::io::Result<Pane> {
     let size = (80, 24); // layout() fits it to the pane right away
     let dir = dir.map(std::path::PathBuf::from).filter(|d| d.is_dir());
     let opts = tty::Options {
-        shell: Some(tty::Shell::new(bash.into(), vec!["--login".into(), "-i".into()])),
+        shell: Some(tty::Shell::new(shell.exe.clone(), shell.args.clone())),
         working_directory: dir.or_else(|| std::env::var_os("USERPROFILE").map(Into::into)),
         drain_on_exit: false,
         env: Default::default(),
         escape_args: true,
     };
     let activity = Arc::new(Activity::default());
-    let pty = Tapped { pty: tty::new(&opts, window_size(size, cell, scale), 0)?, scan: OscScan::default(), ran: false, activity: activity.clone() };
+    let names = Arc::new(Mutex::new(Names::default()));
+    let pty = Tapped { pty: tty::new(&opts, window_size(size, cell, scale), 0)?, scan: OscScan::default(), ran: false, activity: activity.clone(), names: names.clone() };
     let pid = pty.pty.child_watcher().pid().map(|p| p.get());
     let slot = Arc::new(OnceLock::new());
-    let names = Arc::new(Mutex::new(Names::default()));
     let proxy = Proxy { hwnd: hwnd.0 as isize, id, tx: slot.clone(), names: names.clone(), activity: activity.clone() };
     let term = Arc::new(FairMutex::new(Term::new(Config::default(), &TermSize::new(size.0, size.1), proxy.clone())));
     let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)?;
@@ -2069,7 +2141,7 @@ unsafe fn add_pane_in(hwnd: HWND, dir: Option<bool>, cwd: Option<&str>) -> bool 
     let added = with(|a| {
         let id = a.next_id;
         a.next_id += 1;
-        let Ok(p) = spawn(hwnd, id, &a.bash, a.cell, s, cwd) else { return false };
+        let Ok(p) = spawn(hwnd, id, a.shell(), a.cell, s, cwd) else { return false };
         let (at, side_by_side) = match dir {
             Some(d) => (a.focus, d),
             None => auto_split(&a.panes.iter().map(|p| p.rect).collect::<Vec<_>>(), a.focus),
@@ -2088,7 +2160,7 @@ unsafe fn add_pane_in(hwnd: HWND, dir: Option<bool>, cwd: Option<&str>) -> bool 
     if added {
         layout(hwnd);
     } else if with(|a| !a.panes.is_empty()) {
-        toast(hwnd, "could not start Git Bash".into()); // with no panes, the callers say so
+        toast(hwnd, format!("could not start {}", with(|a| a.shell().name))); // with no panes, the callers say so
     }
     added
 }
@@ -2536,7 +2608,7 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
             rt.FillRoundedRectangle(&pane, brush);
             brush.SetColor(&color(fg(), 0.18));
             rt.DrawRoundedRectangle(&pane, brush, 1.0, None);
-            let name = if row.session.is_some() { preview_name(&panes[i], a.home.as_deref()) } else { "Git Bash \u{b7} ~".into() };
+            let name = if row.session.is_some() { preview_name(&panes[i], a.home.as_deref()) } else { format!("{} \u{b7} ~", a.shell().name) };
             text(&name, &a.tab, r, theme().fg, 0.65);
         }
         let caption = preview_caption(row.session.is_none(), &row.created, &row.closed);
@@ -2896,7 +2968,7 @@ unsafe fn open_session(hwnd: HWND, s: Session) -> bool {
         let mut panes = Vec::new();
         for (i, saved) in s.panes.iter().enumerate() {
             let dir = Some(saved.cwd.as_str()).filter(|c| !c.is_empty());
-            let Ok(mut p) = spawn(hwnd, base + i, &a.bash, a.cell, scale, dir) else {
+            let Ok(mut p) = spawn(hwnd, base + i, a.shell(), a.cell, scale, dir) else {
                 panes.iter().for_each(|p: &Pane| drop(p.tx.send(Msg::Shutdown)));
                 return false;
             };
@@ -2965,7 +3037,7 @@ unsafe fn open_choice(hwnd: HWND, i: usize) {
         add_pane(hwnd, None);
     }
     if with(|a| a.panes.is_empty()) {
-        fail("Could not start Git Bash");
+        fail(&format!("Could not start {}", with(|a| a.shell().name)));
         let _ = DestroyWindow(hwnd);
     }
     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -3093,15 +3165,15 @@ unsafe fn apply_settings(hwnd: HWND) {
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
-/// Keys on the settings page: ↑↓ choose, ←→ change the theme or opacity, Enter waits for new keys
-/// for a shortcut (Esc cancels), Del puts back its default, Esc closes the page.
+/// Keys on the settings page: ↑↓ choose, ←→ change the theme, opacity or shell, Enter waits for
+/// new keys for a shortcut (Esc cancels), Del puts back its default, Esc closes the page.
 unsafe fn settings_key(hwnd: HWND, vk: u16, chord: Chord) {
     drop_char(hwnd);
-    let rows = 2 + ACTIONS.len();
+    let rows = LOOK_ROWS + ACTIONS.len();
     let changed = with(|a| {
         let Some(page) = a.page.as_mut() else { return false };
         let s = &mut a.settings;
-        let action = page.sel.checked_sub(2);
+        let action = page.sel.checked_sub(LOOK_ROWS);
         if page.capture {
             page.capture = false;
             match (vk, action) {
@@ -3119,10 +3191,9 @@ unsafe fn settings_key(hwnd: HWND, vk: u16, chord: Chord) {
         match (vk, page.sel) {
             (0x26 | 0x28, _) => page.sel = cycle(rows, page.sel, if vk == 0x26 { -1 } else { 1 }),
             (0x1B, _) => a.page = None,
-            (_, 0) if step != 0 => s.theme = cycle(THEMES.len(), s.theme, step),
-            (_, 1) if step != 0 => s.opacity = (s.opacity + 0.05 * step as f32).clamp(MIN_OPACITY, 1.0),
+            (_, i) if i < LOOK_ROWS && step != 0 => settings_step(s, i, step, &a.shells),
             (0x0D, _) => page.capture = true,
-            (0x2E | 0x08, i) if i >= 2 => s.bind(i - 2, parse_chord(ACTIONS[i - 2].3)),
+            (0x2E | 0x08, i) if i >= LOOK_ROWS => s.bind(i - LOOK_ROWS, parse_chord(ACTIONS[i - LOOK_ROWS].3)),
             _ => return false,
         }
         true
@@ -3135,11 +3206,12 @@ unsafe fn settings_key(hwnd: HWND, vk: u16, chord: Chord) {
 
 const SETTINGS_VALUE: f32 = 18.0; // cells from LAND_X to a settings row's value
 const SETTINGS_W: f32 = 46.0; // cells, width of a settings row's bar
+const LOOK_ROWS: usize = 3; // theme, opacity, shell; the shortcuts follow
 
 /// Top of settings row `i` for rows `lh` DIPs tall: two lines below LAND_Y, with half a line
-/// between the look (theme, opacity) and the shortcuts.
+/// between the look (theme, opacity, shell) and the shortcuts.
 fn settings_y(i: usize, lh: f32) -> f32 {
-    LAND_Y + 2.0 * lh + i as f32 * lh + if i >= 2 { lh / 2.0 } else { 0.0 }
+    LAND_Y + 2.0 * lh + i as f32 * lh + if i >= LOOK_ROWS { lh / 2.0 } else { 0.0 }
 }
 
 /// The settings row (of `rows`) under `(x, y)`, for cells `cw` wide and rows `lh` tall.
@@ -3148,20 +3220,24 @@ fn settings_row((x, y): (f32, f32), cw: f32, lh: f32, rows: usize) -> Option<usi
     (0..rows).find(|&i| across && (settings_y(i, lh)..settings_y(i, lh) + lh).contains(&y))
 }
 
-/// Step the theme (row 0) or the opacity (row 1) by `d`.
-fn settings_step(s: &mut Settings, row: usize, d: isize) {
+/// Step the theme (row 0), the opacity (row 1) or the shell (row 2, through `shells`) by `d`.
+fn settings_step(s: &mut Settings, row: usize, d: isize, shells: &[Shell]) {
     match row {
         0 => s.theme = cycle(THEMES.len(), s.theme, d),
-        _ => s.opacity = (s.opacity + 0.05 * d as f32).clamp(MIN_OPACITY, 1.0),
+        1 => s.opacity = (s.opacity + 0.05 * d as f32).clamp(MIN_OPACITY, 1.0),
+        _ => {
+            let i = shells.iter().position(|x| x.name == pick_shell(shells, &s.shell).name).unwrap_or(0);
+            s.shell = shells[cycle(shells.len(), i, d)].name.into();
+        }
     }
 }
 
-/// The mouse on the settings page: hovering selects a row; a click on the theme or opacity steps
-/// it (back on its ‹, else forward), the wheel steps it too; a click on a shortcut waits for its
-/// new keys, a right-click puts back its default. Elsewhere the wheel moves the selection.
+/// The mouse on the settings page: hovering selects a row; a click on the theme, opacity or
+/// shell steps it (back on its ‹, else forward), the wheel steps it too; a click on a shortcut
+/// waits for its new keys, a right-click puts back its default. Elsewhere the wheel moves the selection.
 unsafe fn settings_mouse(hwnd: HWND, msg: u32, wp: WPARAM) {
     let m = mouse(hwnd);
-    let rows = 2 + ACTIONS.len();
+    let rows = LOOK_ROWS + ACTIONS.len();
     let changed = with(|a| {
         let (cw, lh) = (a.cell.0, land_line(a.cell.1));
         let Some(page) = a.page.as_mut() else { return false };
@@ -3170,22 +3246,22 @@ unsafe fn settings_mouse(hwnd: HWND, msg: u32, wp: WPARAM) {
         let up = (wp.0 >> 16) as u16 as i16 > 0;
         match (msg, row) {
             (WM_MOUSEMOVE, Some(i)) if !page.capture => page.sel = i,
-            (WM_MOUSEWHEEL, Some(i @ 0..=1)) if !page.capture => {
+            (WM_MOUSEWHEEL, Some(i)) if i < LOOK_ROWS && !page.capture => {
                 page.sel = i;
-                settings_step(s, i, if up { 1 } else { -1 });
+                settings_step(s, i, if up { 1 } else { -1 }, &a.shells);
                 return true;
             }
             (WM_MOUSEWHEEL, _) if !page.capture => page.sel = cycle(rows, page.sel, if up { -1 } else { 1 }),
             (WM_LBUTTONDOWN | WM_RBUTTONDOWN, _) if page.capture => page.capture = false,
-            (WM_LBUTTONDOWN, Some(i @ 0..=1)) => {
+            (WM_LBUTTONDOWN, Some(i)) if i < LOOK_ROWS => {
                 page.sel = i;
-                settings_step(s, i, if m.0 < LAND_X + (SETTINGS_VALUE + 1.5) * cw { -1 } else { 1 });
+                settings_step(s, i, if m.0 < LAND_X + (SETTINGS_VALUE + 1.5) * cw { -1 } else { 1 }, &a.shells);
                 return true;
             }
             (WM_LBUTTONDOWN, Some(i)) => (page.sel, page.capture) = (i, true),
-            (WM_RBUTTONDOWN, Some(i)) if i >= 2 => {
+            (WM_RBUTTONDOWN, Some(i)) if i >= LOOK_ROWS => {
                 page.sel = i;
-                s.bind(i - 2, parse_chord(ACTIONS[i - 2].3));
+                s.bind(i - LOOK_ROWS, parse_chord(ACTIONS[i - LOOK_ROWS].3));
                 return true;
             }
             _ => {}
@@ -3215,6 +3291,7 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
     let mut rows = vec![
         ("Theme".to_string(), format!("\u{2039} {} \u{203a}", t.name)),
         ("Opacity".to_string(), format!("\u{2039} {}% \u{203a}", (s.opacity * 100.0).round())),
+        ("Shell".to_string(), format!("\u{2039} {} \u{203a}", a.shell().name)),
     ];
     for (act, k) in ACTIONS.iter().zip(s.keys) {
         rows.push((act.2.to_string(), k.map_or("none".into(), chord_text)));
@@ -3240,7 +3317,7 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
     // The keys of this page, in the footer bar like the landing page's.
     let hints: &[&str] = if page.capture {
         &["press a key with Ctrl or Alt", "Esc or click cancel"]
-    } else if page.sel < 2 {
+    } else if page.sel < LOOK_ROWS {
         &["\u{2191}\u{2193} choose", "\u{2190}\u{2192} change (or click \u{2039} \u{203a}, wheel)", "Esc back"]
     } else {
         &["\u{2191}\u{2193} choose", "Enter or click new keys", "Del or right-click default", "Esc back"]
@@ -3286,7 +3363,7 @@ fn repo_root(dir: &std::path::Path) -> Option<&std::path::Path> {
     dir.ancestors().find(|d| d.join(".git").exists())
 }
 
-/// Git for Windows' git.exe beside the bash.exe the panes run.
+/// Git for Windows' git.exe beside its bash.exe, else git from the PATH.
 fn git_exe(bash: &str) -> String {
     let git = std::path::Path::new(bash).with_file_name("git.exe");
     if git.exists() { git.to_string_lossy().into_owned() } else { "git".into() }
@@ -3315,7 +3392,8 @@ fn worktree_dir(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf
 /// or the existing one; an existing folder is reused), opened in a new pane named `name`.
 // ponytail: git runs on the UI thread; a big checkout freezes the window until it is done.
 unsafe fn open_worktree(hwnd: HWND, name: &str) {
-    let (cwd, exe) = with(|a| (a.panes.get(a.focus).and_then(|p| p.names.lock().ok()?.win.clone()), git_exe(&a.bash)));
+    let cwd = with(|a| a.panes.get(a.focus).and_then(|p| p.names.lock().ok()?.win.clone()));
+    let exe = git_exe(&git_bash());
     let made = (|| {
         if !branch_ok(name) {
             return Err("use letters, digits and - _ . / for the branch".to_string());
@@ -4224,9 +4302,9 @@ unsafe fn fail(text: &str) {
 fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let bash = git_bash();
-        if !std::path::Path::new(&bash).exists() {
-            return fail(&format!("Git Bash not found at {bash}"));
+        let shells = shells();
+        if shells.is_empty() {
+            return fail("No shell found: not even Windows PowerShell or cmd.exe");
         }
         tty::setup_env(); // TERM=xterm-256color, COLORTERM=truecolor
 
@@ -4251,7 +4329,7 @@ fn main() {
         RegisterClassW(&wc);
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
-                d2d, dw, format, bold, label, tab, cap_hot: None, cap_down: None, font_size: FONT_SIZE, cell, target: None, bash, panes: Vec::new(),
+                d2d, dw, format, bold, label, tab, cap_hot: None, cap_down: None, font_size: FONT_SIZE, cell, target: None, shells, panes: Vec::new(),
                 focus: 0, next_id: 0, tree: None, drag: None, surrogate: 0, skip_char: false,
                 select: None, click: (0, f32::MIN, f32::MIN, 0),
                 home: std::env::var("USERPROFILE").ok(), rename: None, title: "dterm".into(),
@@ -4299,7 +4377,7 @@ fn main() {
         } else {
             add_pane(hwnd, None);
             if with(|a| a.panes.is_empty()) {
-                return fail("Could not start Git Bash");
+                return fail(&format!("Could not start {}", with(|a| a.shell().name)));
             }
         }
         SetTimer(Some(hwnd), AGENT_TIMER, AGENT_TICK, None);
@@ -4353,9 +4431,16 @@ fn check() {
     assert_eq!((osc_signal(b"0;title"), osc_signal(b"")), (None, None));
     let scan = |chunks: &[&[u8]]| {
         let (mut s, mut out) = (OscScan::default(), Vec::new());
-        chunks.iter().for_each(|c| s.feed(c, |x| out.push(x)));
+        chunks.iter().for_each(|c| s.feed(c, |p| out.extend(osc_signal(p))));
         out
     };
+    // OSC 9;9 from dterm's PowerShell prompt: the folder, quoted (Windows Terminal's way) or not.
+    assert_eq!((osc_cwd(br"9;9;C:\Users\me").as_deref(), osc_cwd(br#"9;9;"C:\x y""#).as_deref()), (Some(r"C:\Users\me"), Some(r"C:\x y")));
+    assert_eq!((osc_cwd(b"9;9;"), osc_cwd(b"9;4;1;50"), osc_cwd(b"0;title")), (None, None, None));
+    let mut dirs = Vec::new();
+    let long = format!("\x1b]9;9;C:\\{}\x07", "d".repeat(300)); // longer than MAX_PATH still arrives whole
+    OscScan::default().feed(long.as_bytes(), |p| dirs.extend(osc_cwd(p)));
+    assert_eq!(dirs, [format!("C:\\{}", "d".repeat(300))]);
     assert_eq!(scan(&[b"hi\x1b]9;wait\x07", b"\x1b]133;C\x1b\\"]), [Signal::Notify, Signal::Running]);
     assert_eq!(scan(&[b"\x1b]13", b"3;D\x1b", b"\\x"]), [Signal::Finished]); // split across reads
     assert_eq!(scan(&[b"\x1b]9;a\x18\x07\x1b[31m\x1b]133;A\x1b]133;C\x07"]), [Signal::Running]); // CAN aborts; ESC ] restarts
@@ -4406,6 +4491,11 @@ fn check() {
     n.set_title(None);
     n.set_title(Some("  "));
     assert_eq!((n.app.as_deref(), pick_name(None, &n, home).as_deref()), (None, Some("~")));
+    n.set_title(Some("vim"));
+    n.set_dir(r"C:\Users\me\work"); // a PowerShell prompt: Windows folder, and the app title is gone
+    assert_eq!((n.win.as_deref(), pick_name(None, &n, home).as_deref()), (Some(r"C:\Users\me\work"), Some("work")));
+    n.set_dir(r"C:\Users\me");
+    assert_eq!(pick_name(None, &n, home).as_deref(), Some("~"));
     assert_eq!((window_title(None).as_str(), window_title(Some("proj")).as_str()), ("dterm \u{2014} untitled", "dterm \u{2014} proj"));
     // Split tree in a 1000 x 600 window: pane 0 | (pane 1 over pane 2).
     let win = (0.0, 0.0, 1000.0, 600.0);
@@ -4551,13 +4641,23 @@ fn check() {
     // Settings rows under the mouse: half a line between the look and the shortcuts, only across the bars.
     let (cw, lh) = (10.0, 30.0);
     let row = |y: f32| settings_row((LAND_X, y), cw, lh, 14);
-    assert_eq!((row(settings_y(0, lh) + 1.0), row(settings_y(1, lh) + 29.0), row(settings_y(2, lh) + 1.0)), (Some(0), Some(1), Some(2)));
-    assert_eq!((row(settings_y(2, lh) - 1.0), row(settings_y(0, lh) - 1.0), row(settings_y(14, lh) + 1.0)), (None, None, None));
+    assert_eq!((row(settings_y(0, lh) + 1.0), row(settings_y(1, lh) + 29.0), row(settings_y(3, lh) + 1.0)), (Some(0), Some(1), Some(3)));
+    assert_eq!((row(settings_y(3, lh) - 1.0), row(settings_y(0, lh) - 1.0), row(settings_y(14, lh) + 1.0)), (None, None, None));
     assert_eq!(settings_row((LAND_X + SETTINGS_W * cw, settings_y(0, lh) + 1.0), cw, lh, 14), None);
     let mut st = Settings::default();
-    settings_step(&mut st, 0, -1);
-    settings_step(&mut st, 1, 1);
+    let sh = |name| Shell { name, exe: String::new(), args: Vec::new() };
+    let found = [sh(DEFAULT_SHELL), sh("Command Prompt"), sh("Git Bash")];
+    settings_step(&mut st, 0, -1, &found);
+    settings_step(&mut st, 1, 1, &found);
     assert_eq!((st.theme, st.opacity), (THEMES.len() - 1, OPACITY + 0.05));
+    // Shells: step through the installed ones; a saved one not installed here means the first.
+    settings_step(&mut st, 2, -1, &found);
+    assert_eq!(st.shell, "Git Bash");
+    st.shell = "PowerShell 7".into();
+    assert_eq!(pick_shell(&found, &st.shell).name, DEFAULT_SHELL);
+    settings_step(&mut st, 2, 1, &found);
+    assert_eq!(st.shell, "Command Prompt");
+    assert_eq!(pick_shell(&found, "git bash").name, "Git Bash");
     assert_eq!(clip_units("a\nb"), [97, 13, 10, 98, 0]);
     // Sessions: pane 0 | (pane 1 over pane 2), round trip through the file format.
     let tree = Node::Split {
@@ -4706,10 +4806,11 @@ fn check() {
     assert_eq!((st.action(ca(0x54)), st.keys[Action::NewPane as usize]), (Some(Action::Zoom), None));
     st.theme = 2;
     st.opacity = 0.85;
+    st.shell = "Git Bash".into();
     assert_eq!(parse_settings(&settings_text(&st)), st);
-    assert!(settings_text(&st).contains("key new-pane none\n"));
-    let odd = parse_settings("\u{feff}theme nope\nopacity 5\nkey zoom Shift+Q\nkey nope Ctrl+Alt+Q\njunk\n");
-    assert_eq!((odd.theme, odd.opacity, odd.keys[Action::Zoom as usize]), (0, MIN_OPACITY, None));
+    assert!(settings_text(&st).contains("key new-pane none\n") && settings_text(&st).contains("shell Git Bash\n"));
+    let odd = parse_settings("\u{feff}theme nope\nopacity 5\nshell  \nkey zoom Shift+Q\nkey nope Ctrl+Alt+Q\njunk\n");
+    assert_eq!((odd.theme, odd.opacity, odd.shell.as_str(), odd.keys[Action::Zoom as usize]), (0, MIN_OPACITY, DEFAULT_SHELL, None));
     assert_eq!(parse_settings(""), Settings::default());
     // Word steps over "ab  cd" (cells 0..6): right to the end of a word, left to its start.
     let words = |i: i64| !matches!(i, 2 | 3);
@@ -4742,8 +4843,9 @@ fn check() {
     assert_eq!(centered((1000, 600), (0, 0, 1920, 1040)), (460, 220, 1000, 600));
     assert_eq!(centered((1000, 600), (-1920, 100, 1920, 1080)), (-1460, 340, 1000, 600)); // a monitor on the left
     assert_eq!(centered((3000, 2000), (0, 0, 1920, 1040)), (0, 0, 1920, 1040));
-    // Defaults: One Half Dark at 80%; One Half Light is there too, read back by name.
-    assert_eq!((Settings::default().theme, Settings::default().opacity), (0, 0.8));
+    // Defaults: One Half Dark at 80%, Windows PowerShell (every Windows has it); One Half Light is there too, read back by name.
+    assert_eq!((Settings::default().theme, Settings::default().opacity, Settings::default().shell.as_str()), (0, 0.8, "Windows PowerShell"));
+    assert_eq!(unsafe { shells() }[0].name, DEFAULT_SHELL);
     assert_eq!(parse_settings("theme one half light\n").theme, THEMES.len() - 1);
     // Tooltips read the current shortcuts.
     let mut keys = Settings::default().keys;
@@ -4755,20 +4857,40 @@ fn check() {
     assert_eq!(caption_tip(3, View::Grid, true, &keys), ("Restore", None));
 }
 
-#[test]
-#[ignore] // starts Git Bash: cargo test -- --ignored
-fn typeahead_reaches_bash() {
-    let bash = unsafe { git_bash() };
-    let p = spawn(HWND(std::ptr::null_mut()), 0, &bash, (8.0, 16.0), 1.0, None).expect("bash");
-    p.send(b"echo dterm_ok_$((40+2))\r".to_vec());
-    let found = (0..100).any(|_| {
+/// Wait up to 10 s for `text` on pane `p`'s screen.
+#[cfg(test)]
+fn shows(p: &Pane, text: &str) -> bool {
+    (0..100).any(|_| {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let t = p.term.lock();
         (0..t.screen_lines() as i32).any(|l| {
             let row = &t.grid()[Line(l)];
-            (0..t.columns()).map(|c| row[Column(c)].c).collect::<String>().contains("dterm_ok_42")
+            (0..t.columns()).map(|c| row[Column(c)].c).collect::<String>().contains(text)
         })
-    });
+    })
+}
+
+#[test]
+#[ignore] // starts Windows PowerShell: cargo test -- --ignored
+fn powershell_reports_its_folder() {
+    let shells = unsafe { shells() };
+    let p = spawn(HWND(std::ptr::null_mut()), 0, pick_shell(&shells, DEFAULT_SHELL), (8.0, 16.0), 1.0, None).expect("powershell");
+    p.send(b"cd C:\\Windows; echo dterm_ok_$(40+2)\r".to_vec());
+    let found = shows(&p, "dterm_ok_42");
+    std::thread::sleep(std::time::Duration::from_millis(500)); // the next prompt
+    let win = p.names.lock().unwrap().win.clone();
+    let _ = p.tx.send(Msg::Shutdown);
+    assert!(found, "the typed-ahead command never ran");
+    assert_eq!(win.as_deref(), Some("C:\\Windows"));
+}
+
+#[test]
+#[ignore] // starts Git Bash: cargo test -- --ignored
+fn typeahead_reaches_bash() {
+    let shells = unsafe { shells() };
+    let p = spawn(HWND(std::ptr::null_mut()), 0, pick_shell(&shells, "Git Bash"), (8.0, 16.0), 1.0, None).expect("bash");
+    p.send(b"echo dterm_ok_$((40+2))\r".to_vec());
+    let found = shows(&p, "dterm_ok_42");
     let _ = p.tx.send(Msg::Shutdown);
     assert!(found, "the typed-ahead command never ran");
 }
