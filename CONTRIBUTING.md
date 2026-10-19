@@ -71,6 +71,18 @@ matches the newest conversation in `~\.claude\projects\<folder>` and saves `clau
 `aider --restore-chat-history`, codex and opencode their bare name. Only those exact command shapes are ever typed
 back in (`resume_command` checks).
 
+## How work is tracked
+
+Everything goes through [GitHub issues](https://github.com/Betadeimos/dterm/issues):
+
+1. **Find or open an issue first:** what, why, where to look in the code, and when it counts as done.
+2. **One branch per issue** (`feat/17-shell-picker`, `fix/14-claude-swap`), and mention the issue
+   in commits and the pull request (`Fixes #17`).
+3. **Close it when merged,** saying what was built and what was left out; leftovers become new issues.
+4. **Found a bug or an idea along the way?** Open an issue rather than leaving a TODO.
+
+[ROADMAP.md](ROADMAP.md) only keeps the direction, the history and lessons learned.
+
 ## Making a change
 
 - Match the surrounding style: terse code, comments that say why, sizes in DIPs.
@@ -79,4 +91,4 @@ back in (`resume_command` checks).
 - Keep the README shortcut tables and the module doc comment at the top of `main.rs` in sync with behavior.
 - One focused change per pull request, and say what you tried by hand.
 
-Open work is tracked in [GitHub issues](https://github.com/Betadeimos/dterm/issues); [ROADMAP.md](ROADMAP.md) has the history and reasoning. Issues labeled **good first issue** are a fair place to start.
+Issues labeled **good first issue** are a fair place to start.
