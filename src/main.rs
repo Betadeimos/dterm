@@ -2000,6 +2000,8 @@ unsafe fn caption_mouse(hwnd: HWND, msg: u32) -> bool {
 static ACCENT: AtomicBool = AtomicBool::new(false);
 const ACCENT_ACRYLIC: u32 = 4; // ACCENT_ENABLE_ACRYLICBLURBEHIND
 const ACCENT_BLUR: u32 = 3; // ACCENT_ENABLE_BLURBEHIND
+/// Set between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE, while the accent is plain blur.
+static MOVING: AtomicBool = AtomicBool::new(false);
 
 /// Sets the undocumented accent policy (WCA_ACCENT_POLICY = 19). Acrylic halves the frame rate
 /// while the window is dragged (30 fps on Windows 10 22H2), so moves and resizes use plain blur.
@@ -3357,7 +3359,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // whenever another window has the focus.
         WM_NCACTIVATE => return DefWindowProcW(hwnd, msg, WPARAM(1), lp),
         // Minimized, the client area is 0x0: refitting would squeeze every shell to 2x1.
-        WM_SIZE if wp.0 != SIZE_MINIMIZED as usize => layout(hwnd),
+        WM_SIZE if wp.0 != SIZE_MINIMIZED as usize => {
+            // Dragging a maximized window restores it mid-move; the blur keeps the maximized
+            // region and trails the window as a monitor-sized panel unless the policy is renewed.
+            if ACCENT.load(Ordering::Relaxed) && wp.0 == SIZE_RESTORED as usize {
+                let state = if MOVING.load(Ordering::Relaxed) { ACCENT_BLUR } else { ACCENT_ACRYLIC };
+                set_accent(hwnd, 0);
+                set_accent(hwnd, state);
+            }
+            layout(hwnd)
+        }
         // Moved to a monitor with another scale: take the size Windows suggests and draw at the new DPI.
         WM_DPICHANGED => {
             let r = *(lp.0 as *const RECT);
@@ -3404,8 +3415,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(hit as isize);
         }
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP if caption_mouse(hwnd, msg) => return LRESULT(0),
-        WM_ENTERSIZEMOVE if ACCENT.load(Ordering::Relaxed) => _ = set_accent(hwnd, ACCENT_BLUR),
+        WM_ENTERSIZEMOVE if ACCENT.load(Ordering::Relaxed) => {
+            MOVING.store(true, Ordering::Relaxed);
+            _ = set_accent(hwnd, ACCENT_BLUR)
+        }
         WM_EXITSIZEMOVE if ACCENT.load(Ordering::Relaxed) => {
+            MOVING.store(false, Ordering::Relaxed);
             // Going straight from blur back to acrylic keeps the blur; switching off in between doesn't.
             set_accent(hwnd, 0);
             set_accent(hwnd, ACCENT_ACRYLIC);
