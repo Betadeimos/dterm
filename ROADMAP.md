@@ -23,9 +23,6 @@ shells and sessions (#13, #17), look (#4, #5, #12), project (#6, #11, #22, #23, 
 
 ## History
 
-**v0.3.1:** a heavier icon: D_ in JetBrains Mono ExtraBold, larger and centered by its ink in the
-green tile.
-
 **v0.3.0, the Native Agent Orchestrator Release**
 - OSC 9 / 777 notifications turn a background pane's dot yellow at once; an OSC 133 prompt after
   a command turns it green at once. dterm scans the raw PTY output before the terminal parser,
@@ -35,7 +32,8 @@ green tile.
   back from a session file.
 - Broadcast input (`Ctrl+Alt+B`), a one-key git worktree pane (`Ctrl+Alt+N`), mouse on the
   settings page, mouse clicks and drags reported to apps (Shift+drag still selects).
-- New green icon with a frame for every taskbar size, One Half Light theme, 80% default opacity,
+- New green icon (D_ in JetBrains Mono ExtraBold, centered by its ink) with a frame for every
+  taskbar size, One Half Light theme, 80% default opacity,
   `D_term` logo, windows open centered.
 
 **v0.2.2:** the status became a solid dot before the pane's name (blue busy, green done after 4.5 s
