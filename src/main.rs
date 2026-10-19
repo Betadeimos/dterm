@@ -4321,8 +4321,18 @@ unsafe fn fail(text: &str) {
     MessageBoxW(None, PCWSTR(wide(text).as_ptr()), w!("dterm"), MB_ICONERROR);
 }
 
+/// Claude Code's per-session markers. Inherited by a pane, they make a claude started there think
+/// it is a child session, and it stops saving its transcript.
+const CLAUDE_SESSION_VARS: [&str; 9] = [
+    "AI_AGENT", "CLAUDECODE", "CLAUDE_PID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+];
+
 fn main() {
     unsafe {
+        for var in CLAUDE_SESSION_VARS {
+            std::env::remove_var(var); // before any pane is spawned: panes inherit this environment
+        }
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let shells = shells();
         if shells.is_empty() {
