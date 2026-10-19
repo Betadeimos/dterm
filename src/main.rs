@@ -77,6 +77,7 @@ const FONT: PCWSTR = w!("Cascadia Mono");
 const FONT_SIZE: f32 = 16.0; // DIPs, = 12pt like Windows Terminal
 const PAD: f32 = 8.0; // DIPs around the text, like Windows Terminal
 const LABEL_TOP: f32 = 22.0; // top margin of a pane that shows a name label
+const BADGE_W: f32 = 20.0; // the pane number shown while Ctrl+Alt is held
 const LABEL_SIZE: f32 = 11.0; // DIPs
 const NAME_MAX: usize = 32; // characters of a typed pane name
 const MSYSTEMS: [&str; 6] = ["MINGW64", "MINGW32", "MSYS", "UCRT64", "CLANG64", "CLANGARM64"];
@@ -2437,6 +2438,7 @@ unsafe fn paint(hwnd: HWND) {
         }
         rt.Clear(Some(&color(rgb(theme().gap), 0.9)));
         let (several, labeled) = (a.view == View::Grid && a.panes.len() > 1, a.labeled());
+        let order = if numbers_shown() { a.order() } else { Vec::new() };
         for (i, p) in a.panes.iter().enumerate().filter(|&(i, _)| a.is_shown(i)) {
             let (x, y, pw, ph) = p.rect;
             let (r, focused) = (rect(x, y, pw, ph), i == a.focus);
@@ -2469,6 +2471,16 @@ unsafe fn paint(hwnd: HWND) {
                 brush.SetColor(&color(fg(), alpha));
                 let units: Vec<u16> = text.encode_utf16().collect();
                 let slot = rect(x + PAD + dx, y, (pw - 2.0 * PAD - dx).max(0.0), LABEL_TOP);
+                rt.DrawText(&units, &a.label, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+            }
+            // Ctrl+Alt held: the pane's number for Ctrl+Alt+N, on a badge in its top-right corner.
+            if let Some(n) = order.iter().position(|&id| id == p.id).filter(|&n| n < 9) {
+                let badge = rect(x + pw - PAD - BADGE_W, y + 2.0, BADGE_W, LABEL_TOP - 4.0);
+                brush.SetColor(&color(bg(), 0.95));
+                rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: badge, radiusX: 4.0, radiusY: 4.0 }, brush);
+                brush.SetColor(&color(fg(), 1.0));
+                let units: Vec<u16> = (n + 1).to_string().encode_utf16().collect();
+                let slot = rect(x + pw - PAD - BADGE_W + 7.0, y, BADGE_W, LABEL_TOP);
                 rt.DrawText(&units, &a.label, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
             }
             rt.PopAxisAlignedClip();
@@ -2706,7 +2718,9 @@ unsafe fn draw_chrome(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCol
                         (_, true) => LABEL_FOCUS_ALPHA,
                         _ => LABEL_ALPHA,
                     };
-                    (p.label(a.home.as_deref()), alpha)
+                    let label = p.label(a.home.as_deref());
+                    // Ctrl+Alt held: the tab's number for Ctrl+Alt+N goes first.
+                    (if n < 9 && numbers_shown() { format!("{}  {label}", n + 1) } else { label }, alpha)
                 }
             };
             let (x, room) = (n as f32 * tw + TAB_PAD, (tw - 2.0 * TAB_PAD).max(0.0));
@@ -3526,6 +3540,13 @@ unsafe fn altgr_char(vk: u16, scan: u32) -> bool {
     n != 0 && out[0] >= 0x20
 }
 
+/// Whether panes show their number for Ctrl+Alt+1 … 9: Ctrl+Alt held while dterm is active. AltGr
+/// (right Alt) does not count, so typing { or [ does not flash them.
+unsafe fn numbers_shown() -> bool {
+    let down = |k: VIRTUAL_KEY| GetAsyncKeyState(k.0 as i32) < 0;
+    down(VK_CONTROL) && down(VK_LMENU) && !down(VK_RMENU) && !GetActiveWindow().is_invalid()
+}
+
 /// Run a dterm command (see ACTIONS).
 unsafe fn run(hwnd: HWND, act: Action) {
     drop_char(hwnd);
@@ -4158,7 +4179,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let _ = SetCursor(LoadCursorW(None, IDC_ARROW).ok());
             return LRESULT(1);
         }
+        // Pressing or releasing Ctrl or Alt shows or hides the pane numbers (not on auto-repeat).
+        WM_KEYUP | WM_SYSKEYUP if matches!(wp.0, 0x11 | 0x12) => {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if matches!(wp.0, 0x11 | 0x12) && lp.0 & (1 << 30) == 0 {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
             if on_key(hwnd, wp.0 as u16, (lp.0 as u32 >> 16) & 0xFF) {
                 return LRESULT(0);
             }
