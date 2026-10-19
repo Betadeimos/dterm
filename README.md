@@ -129,6 +129,16 @@ Native Rust, Direct2D and DirectWrite, ConPTY.
 Download `dterm-vX.Y.Z.exe` (or the zip) from [Releases](https://github.com/Betadeimos/dterm/releases)
 and run it. No installer: put it anywhere and pin it to the taskbar.
 
+**"Windows protected your PC"?** The exe is not code-signed yet, so SmartScreen warns about it
+until enough people have run it. Click **More info**, then **Run anyway**. To check that your copy is
+the one built for the release, compare its hash with `SHA256SUMS.txt` on the release page:
+
+```
+certutil -hashfile dterm-vX.Y.Z.exe SHA256
+```
+
+Or [build it from source](#build-from-source) yourself.
+
 **Requires** Windows 10 1809+. [Git for Windows](https://gitforwindows.org/) is optional: it adds Git Bash
 and the worktree shortcut. Windows 11 22H2+ uses the
 system acrylic; Windows 10 gets dterm's own.
