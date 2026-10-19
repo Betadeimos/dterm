@@ -3214,10 +3214,26 @@ fn settings_y(i: usize, lh: f32) -> f32 {
     LAND_Y + 2.0 * lh + i as f32 * lh + if i >= LOOK_ROWS { lh / 2.0 } else { 0.0 }
 }
 
-/// The settings row (of `rows`) under `(x, y)`, for cells `cw` wide and rows `lh` tall.
-fn settings_row((x, y): (f32, f32), cw: f32, lh: f32, rows: usize) -> Option<usize> {
-    let across = (LAND_X - 12.0..LAND_X - 12.0 + SETTINGS_W * cw).contains(&x);
-    (0..rows).find(|&i| across && (settings_y(i, lh)..settings_y(i, lh) + lh).contains(&y))
+const SETTINGS_SPLIT: usize = LOOK_ROWS + 5; // first row of the right column, when there is one
+const SETTINGS_GAP: f32 = 4.0; // cells between the two columns
+
+/// Where settings row `i` starts (its text; the bar begins 12 DIPs to the left) on a page `w`
+/// DIPs wide: one column, or with room for two, the rows from SETTINGS_SPLIT on fill a right
+/// column from the top.
+fn settings_at(i: usize, cw: f32, lh: f32, w: f32) -> (f32, f32) {
+    let two = w >= 2.0 * LAND_X + (2.0 * SETTINGS_W + SETTINGS_GAP) * cw;
+    match i.checked_sub(SETTINGS_SPLIT) {
+        Some(j) if two => (LAND_X + (SETTINGS_W + SETTINGS_GAP) * cw, LAND_Y + 2.0 * lh + j as f32 * lh),
+        _ => (LAND_X, settings_y(i, lh)),
+    }
+}
+
+/// The settings row (of `rows`) under `(x, y)`, for cells `cw` wide, rows `lh` tall, a page `w` wide.
+fn settings_row((x, y): (f32, f32), cw: f32, lh: f32, rows: usize, w: f32) -> Option<usize> {
+    (0..rows).find(|&i| {
+        let (rx, ry) = settings_at(i, cw, lh, w);
+        (rx - 12.0..rx - 12.0 + SETTINGS_W * cw).contains(&x) && (ry..ry + lh).contains(&y)
+    })
 }
 
 /// Step the theme (row 0), the opacity (row 1) or the shell (row 2, through `shells`) by `d`.
@@ -3236,13 +3252,13 @@ fn settings_step(s: &mut Settings, row: usize, d: isize, shells: &[Shell]) {
 /// shell steps it (back on its ‹, else forward), the wheel steps it too; a click on a shortcut
 /// waits for its new keys, a right-click puts back its default. Elsewhere the wheel moves the selection.
 unsafe fn settings_mouse(hwnd: HWND, msg: u32, wp: WPARAM) {
-    let m = mouse(hwnd);
+    let (m, w) = (mouse(hwnd), client(hwnd).0);
     let rows = LOOK_ROWS + ACTIONS.len();
     let changed = with(|a| {
         let (cw, lh) = (a.cell.0, land_line(a.cell.1));
         let Some(page) = a.page.as_mut() else { return false };
         let s = &mut a.settings;
-        let row = settings_row(m, cw, lh, rows);
+        let row = settings_row(m, cw, lh, rows, w);
         let up = (wp.0 >> 16) as u16 as i16 > 0;
         match (msg, row) {
             (WM_MOUSEMOVE, Some(i)) if !page.capture => page.sel = i,
@@ -3296,21 +3312,22 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
     for (act, k) in ACTIONS.iter().zip(s.keys) {
         rows.push((act.2.to_string(), k.map_or("none".into(), chord_text)));
     }
-    let value_x = LAND_X + SETTINGS_VALUE * cw;
+    let mut bottom: f32 = 0.0;
     for (i, (label, value)) in rows.iter().enumerate() {
-        let y = settings_y(i, lh);
+        let (x, y) = settings_at(i, cw, lh, size.0);
+        bottom = bottom.max(y + lh);
         let on = i == page.sel;
         let value = if on && page.capture { "press the new keys\u{2026}".to_string() } else { value.clone() };
         if on {
             brush.SetColor(&color(fg(), 0.07));
-            let bar = D2D1_ROUNDED_RECT { rect: rect(LAND_X - 12.0, y, SETTINGS_W * cw, lh), radiusX: 6.0, radiusY: 6.0 };
+            let bar = D2D1_ROUNDED_RECT { rect: rect(x - 12.0, y, SETTINGS_W * cw, lh), radiusX: 6.0, radiusY: 6.0 };
             rt.FillRoundedRectangle(&bar, brush);
-            line("\u{276f}", LAND_X, y, t.ansi[2], 1.0);
+            line("\u{276f}", x, y, t.ansi[2], 1.0);
         }
-        line(label, LAND_X + 2.0 * cw, y, t.fg, if on { 1.0 } else { 0.6 });
-        line(&value, value_x, y, if on && page.capture { t.ansi[3] } else { t.fg }, if on { 0.9 } else { 0.45 });
+        line(label, x + 2.0 * cw, y, t.fg, if on { 1.0 } else { 0.6 });
+        line(&value, x + SETTINGS_VALUE * cw, y, if on && page.capture { t.ansi[3] } else { t.fg }, if on { 0.9 } else { 0.45 });
     }
-    let y = settings_y(rows.len(), lh) + lh;
+    let y = bottom + lh;
     line("fixed: Alt+arrows focus   Alt+Shift+arrows resize   Ctrl+Alt+arrows swap   Ctrl+Tab next pane", LAND_X, y, t.fg, 0.25);
     line("Shift+arrows select (Ctrl: by word)   Ctrl+C / Ctrl+V copy, paste   Ctrl+Plus / Minus / 0 font", LAND_X, y + lh, t.fg, 0.25);
     line("Shift+drag selects in apps that take the mouse (vim, tmux, htop)", LAND_X, y + 2.0 * lh, t.fg, 0.25);
@@ -4640,10 +4657,15 @@ fn check() {
     assert_eq!(mouse_report(TermMode::NONE, 0, true, false, 0, (0, 0)), None);
     // Settings rows under the mouse: half a line between the look and the shortcuts, only across the bars.
     let (cw, lh) = (10.0, 30.0);
-    let row = |y: f32| settings_row((LAND_X, y), cw, lh, 14);
+    let row = |y: f32| settings_row((LAND_X, y), cw, lh, 14, 500.0);
     assert_eq!((row(settings_y(0, lh) + 1.0), row(settings_y(1, lh) + 29.0), row(settings_y(3, lh) + 1.0)), (Some(0), Some(1), Some(3)));
     assert_eq!((row(settings_y(3, lh) - 1.0), row(settings_y(0, lh) - 1.0), row(settings_y(14, lh) + 1.0)), (None, None, None));
-    assert_eq!(settings_row((LAND_X + SETTINGS_W * cw, settings_y(0, lh) + 1.0), cw, lh, 14), None);
+    assert_eq!(settings_row((LAND_X + SETTINGS_W * cw, settings_y(0, lh) + 1.0), cw, lh, 14, 500.0), None);
+    // A wide page: the rows from SETTINGS_SPLIT on fill a right column from the top.
+    let (wide, right) = (2000.0, LAND_X + (SETTINGS_W + SETTINGS_GAP) * cw);
+    assert_eq!((settings_at(SETTINGS_SPLIT - 1, cw, lh, wide), settings_at(SETTINGS_SPLIT, cw, lh, wide)), ((LAND_X, settings_y(SETTINGS_SPLIT - 1, lh)), (right, settings_y(0, lh))));
+    assert_eq!(settings_at(SETTINGS_SPLIT, cw, lh, 900.0), (LAND_X, settings_y(SETTINGS_SPLIT, lh))); // too narrow: one column
+    assert_eq!((settings_row((right, settings_y(0, lh) + 1.0), cw, lh, 14, wide), settings_row((LAND_X, settings_y(0, lh) + 1.0), cw, lh, 14, wide)), (Some(SETTINGS_SPLIT), Some(0)));
     let mut st = Settings::default();
     let sh = |name| Shell { name, exe: String::new(), args: Vec::new() };
     let found = [sh(DEFAULT_SHELL), sh("Command Prompt"), sh("Git Bash")];
