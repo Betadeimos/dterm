@@ -12,7 +12,8 @@
 //! branch and opens a git worktree of the focused pane's repo (`../<repo>-<branch>`) in a new pane.
 //! AltGr+key still types its character where the keyboard layout has one.
 //! Fixed keys: Alt+arrows move the focus, Alt+Shift+arrows resize, Ctrl+Alt+arrows swap panes, drag
-//! the gaps to resize, Ctrl+Tab / Ctrl+Shift+Tab go to the next / previous pane. Select with the
+//! the gaps to resize, Ctrl+Tab / Ctrl+Shift+Tab go to the next / previous pane, Ctrl+Alt+1 … 9
+//! to the Nth (in Zoom, shown zoomed). Select with the
 //! mouse or Shift+arrows (Ctrl+Shift+Left / Right by word), copy with Ctrl+C (or right-click),
 //! Ctrl+V pastes plain text, the wheel scrolls back, Ctrl+Plus / Minus / 0 / wheel set the font size.
 //! Apps that ask for the mouse (vim, tmux, htop) get clicks and drags; Shift+drag still selects.
@@ -3356,7 +3357,7 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
     let y = bottom + lh;
     line("fixed: Alt+arrows focus   Alt+Shift+arrows resize   Ctrl+Alt+arrows swap   Ctrl+Tab next pane", LAND_X, y, t.fg, 0.25);
     line("Shift+arrows select (Ctrl: by word)   Ctrl+C / Ctrl+V copy, paste   Ctrl+Plus / Minus / 0 font", LAND_X, y + lh, t.fg, 0.25);
-    line("Shift+drag selects in apps that take the mouse (vim, tmux, htop)", LAND_X, y + 2.0 * lh, t.fg, 0.25);
+    line("Ctrl+Alt+1 \u{2026} 9 pane N   Shift+drag selects in apps that take the mouse (vim, tmux, htop)", LAND_X, y + 2.0 * lh, t.fg, 0.25);
     // The keys of this page, in the footer bar like the landing page's.
     let hints: &[&str] = if page.capture {
         &["press a key with Ctrl or Alt", "Esc or click cancel"]
@@ -3659,6 +3660,18 @@ unsafe fn on_key(hwnd: HWND, vk: u16, scan: u32) -> bool {
         drop_char(hwnd);
         leave_zoom(hwnd);
         with(|a| a.focus_step(if shift { -1 } else { 1 }));
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        return true;
+    }
+    // Ctrl+Alt+1 … 9 focus the Nth pane in tab order; Zoom shows that pane. AltGr characters win.
+    if ctrl && alt && !shift && (0x31..=0x39).contains(&vk) && !altgr_char(vk, scan) {
+        drop_char(hwnd);
+        with(|a| {
+            if let Some(&id) = a.order().get((vk - 0x31) as usize) {
+                a.focus_id(id);
+            }
+        });
+        layout(hwnd);
         let _ = InvalidateRect(Some(hwnd), None, false);
         return true;
     }
