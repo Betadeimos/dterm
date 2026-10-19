@@ -3727,9 +3727,11 @@ fn main() {
             // Windows 10 and Windows 11 before 22H2 have no system backdrops. The extended frame
             // would hide the accent's acrylic behind black, so it is left out.
             ACCENT.store(set_accent(hwnd, ACCENT_ACRYLIC), Ordering::Relaxed);
-            let flags = SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
-            let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, flags); // WM_NCCALCSIZE drops the system frame
         }
+        // CreateWindowExW only sends WM_NCCALCSIZE with wParam 0, which keeps the system caption;
+        // force a recalc so WM_NCCALCSIZE drops it on every version, not just after the first resize.
+        let flags = SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, flags);
 
         // With a last or saved session, start on the landing page; otherwise straight in a new one.
         let rows = data_dir().map(|d| landing_rows(&d, &ago)).unwrap_or_default();
