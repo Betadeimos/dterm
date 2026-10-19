@@ -1964,10 +1964,27 @@ unsafe fn started(pid: u32) -> Option<u64> {
 /// Claude Code's folder for the conversations started in `cwd`: `.claude\projects\<cwd with every
 /// character but ASCII letters and digits turned into ->`.
 fn claude_project(cwd: &str) -> Option<std::path::PathBuf> {
-    let home = || std::env::var_os("USERPROFILE").map(|h| std::path::PathBuf::from(h).join(".claude"));
-    let base = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from).or_else(home)?;
     let name: String = cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    Some(base.join("projects").join(name))
+    Some(claude_dir()?.join("projects").join(name))
+}
+
+/// Claude Code's config folder: `CLAUDE_CONFIG_DIR`, or `.claude` in the home folder.
+fn claude_dir() -> Option<std::path::PathBuf> {
+    let home = || std::env::var_os("USERPROFILE").map(|h| std::path::PathBuf::from(h).join(".claude"));
+    std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from).or_else(home)
+}
+
+/// The string value of `key` in a flat JSON object, when it has no escapes (enough for ids).
+fn json_str<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let rest = &json[json.find(&format!("\"{key}\""))? + key.len() + 2..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    Some(&rest[..rest.find('"')?]).filter(|v| !v.contains('\\'))
+}
+
+/// The conversation Claude Code process `pid` is in, from the `sessions\<pid>.json` it keeps.
+fn claude_session(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(claude_dir()?.join("sessions").join(format!("{pid}.json"))).ok()?;
+    json_str(&text, "sessionId").map(Into::into)
 }
 
 /// Ids of the conversations in Claude Code folder `dir` written to since `since` (Unix seconds), newest first.
@@ -2006,9 +2023,9 @@ fn agent(procs: &[(u32, u32, String)], shell: u32) -> Option<(u32, &'static str)
 }
 
 /// The command that brings back the agent running under shell process `shell` in `cwd`. Claude
-/// Code resumes its newest conversation that no other pane has `taken` (or starts fresh when it
-/// has none yet), aider reloads its chat history, codex and opencode start again in the folder.
-// ponytail: two Claude panes in one folder may swap conversations; matching by open file handles would pin them.
+/// Code resumes the conversation its process says it is in, else its newest one that no other pane
+/// has `taken` (or starts fresh when it has none yet), aider reloads its chat history, codex and
+/// opencode start again in the folder.
 fn agent_run(procs: &[(u32, u32, String)], shell: u32, cwd: &str, taken: &mut Vec<String>) -> Option<String> {
     let (pid, name) = agent(procs, shell)?;
     if name == "aider" {
@@ -2016,8 +2033,12 @@ fn agent_run(procs: &[(u32, u32, String)], shell: u32, cwd: &str, taken: &mut Ve
     } else if name != "claude" {
         return Some(name.into());
     }
+    let dir = claude_project(cwd);
+    // Only a conversation with a file can be resumed: a fresh one has none until the first message.
+    let own = claude_session(pid).filter(|id| dir.as_ref().is_some_and(|d| d.join(format!("{id}.jsonl")).is_file()));
     let since = unsafe { started(pid) }.unwrap_or(0);
-    let ids = claude_project(cwd).map(|d| recent_conversations(&d, since)).unwrap_or_default();
+    let mut ids = own.into_iter().collect::<Vec<_>>();
+    ids.extend(dir.map(|d| recent_conversations(&d, since)).unwrap_or_default());
     Some(match ids.into_iter().find(|id| !taken.contains(id)) {
         Some(id) => {
             let run = format!("claude --resume {id}");
@@ -4870,6 +4891,8 @@ fn check() {
     assert_eq!(agent_run(&[(40, 1, "bash.exe".into()), (41, 40, "aider.exe".into())], 40, "", &mut Vec::new()).as_deref(), Some("aider --restore-chat-history"));
     let dir = claude_project("N:\\Davide Chincoli\\12_CODING\\dterm").unwrap();
     assert_eq!(dir.file_name().unwrap(), "N--Davide-Chincoli-12-CODING-dterm");
+    let json = r#"{"pid":7,"sessionId" : "ab-12","cwd":"C:\\x"}"#;
+    assert_eq!((json_str(json, "sessionId"), json_str(json, "pid"), json_str(json, "cwd"), json_str(json, "no")), (Some("ab-12"), None, None, None));
     // Own frame on Windows 10: edges resize, the caption drags except over its buttons.
     let hit = |x, y, border| frame_hit((x, y), (800, 600), border, 32, (138, 138));
     assert_eq!((hit(0, 0, 6), hit(799, 0, 6), hit(0, 599, 6), hit(799, 599, 6)), (HTTOPLEFT, HTTOPRIGHT, HTBOTTOMLEFT, HTBOTTOMRIGHT));
