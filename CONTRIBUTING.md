@@ -19,6 +19,14 @@ The icon is linked from the prebuilt `dterm.res`, so no resource compiler is nee
 Release builds use `opt-level = "z"`, LTO and `panic = "abort"` to stay tiny: check `target\release\dterm.exe`
 size before and after your change, and avoid new crates unless they earn their bytes.
 
+## README screenshot and GIFs
+
+`assets/demo/` records them: `world.py up` builds small demo repos on a `K:` subst drive,
+`scenes.py <scene>` drives a fresh dterm with scripted keys and mouse over a gradient backdrop and
+captures it with ffmpeg, into `%TEMP%\dterm-demo\out`. The steps are at the top of `scenes.py`.
+Copy the results to `assets/features/` (GIFs) and `assets/screenshot.png` (hero) when a feature's
+look changes. Needs Python, ffmpeg and git; `agents` and `hero` also need Claude Code.
+
 ## Layout
 
 Everything is in `src/main.rs` (about 4000 lines) on purpose, for now. Rough map, top to bottom:

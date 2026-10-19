@@ -15,13 +15,23 @@ is the direction and the history; it has no to-do list of its own.
 3. **Sessions that come back** with layout, names, folders and agents, from a quick start page.
 4. **Stays tiny:** one native exe (~500 KB), instant start, no Electron, no new crates unless they
    earn their bytes.
-5. **Easy for newcomers:** works out of the box, with the shell you already have
-   ([#17](https://github.com/Betadeimos/dterm/issues/17)).
+5. **Easy for newcomers:** works out of the box in Windows PowerShell, with the other shells one
+   setting away.
 
 Main open threads: agents (#7, #14, #15, #16, #20), panes and input (#8, #9, #10, #18, #19, #21),
-shells and sessions (#13, #17), look (#4, #5, #12), project (#6, #11, #22, #23, #24).
+shells and sessions (#13, #26, #27), look (#4, #5, #12), project (#6, #11, #22, #23, #24).
 
 ## History
+
+**v0.3.1, the Any Shell Release**
+- A fresh install starts in Windows PowerShell, so Git for Windows is no longer needed. A Shell
+  row on the settings page picks Windows PowerShell, PowerShell 7, Command Prompt or Git Bash for
+  new panes ([#17](https://github.com/Betadeimos/dterm/issues/17)).
+- PowerShell panes report their folder through a prompt hook (OSC 9;9), so they are named after it
+  and come back in it, like Git Bash panes.
+- The settings page has two columns: general settings on the left, shortcuts on the right.
+- The README shows a screenshot and one GIF per feature, recorded by `assets/demo/` (scripted
+  keys and mouse, ffmpeg capture).
 
 **v0.3.0, the Native Agent Orchestrator Release**
 - OSC 9 / 777 notifications turn a background pane's dot yellow at once; an OSC 133 prompt after
@@ -59,6 +69,9 @@ bar there); font size keys.
   On Windows 10, host backdrop brushes render black and a window region brings back the old frame.
 - Watch the exe size on every change: `std::process::Command` alone added 73 KB (replaced by
   `CreateProcessW`).
+- Recording demos: pass window handles to Win32 as `HWND`, not plain ints (a 64-bit handle gets
+  truncated and SetWindowPos silently fails); strip the Claude Code session variables from the
+  environment, or the demo's claude stops saving transcripts and can't be resumed.
 - Icons need a frame for every size Windows asks for (16, 20, 24, 32, 40, 48, 64, 256); the
   taskbar's 24 px scaled from 32 px blurs.
 

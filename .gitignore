@@ -1,3 +1,4 @@
 /target
 /dterm.exe
 /dist
+__pycache__/

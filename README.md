@@ -17,36 +17,102 @@
 
 </div>
 
-![dterm demo: the start page, a saved session, adding panes, zoom, tabs, then themes and opacity in settings](assets/demo.gif)
+![dterm: Claude Code, a git graph, tests and a build side by side, on acrylic](assets/screenshot.png)
 
-## Why dterm
+## Features
 
-- **The grid builds itself.** `Ctrl+Alt+T` splits the largest pane. Press it four times, get a 2x2.
-- **Drag to resize.** Grab any gap between panes and pull. (Windows Terminal has had this
-  [open since 2019](https://github.com/microsoft/terminal/issues/992).)
-- **Grid or Tabs, same sessions.** `Ctrl+Alt+G` flips between them without touching a shell.
-- **Your agents come back.** Close dterm, reopen it: every pane returns to its folder, and panes that
-  ran a coding agent start it again: [Claude Code](https://claude.com/claude-code) resumes its newest
-  conversation (`claude --resume <id>`), aider reloads its chat (`aider --restore-chat-history`), codex
-  and opencode restart in the folder. A small `[claude]` / `[codex]` / `[opencode]` / `[aider]` tag
-  marks the panes running one.
-- **See which pane needs you.** A small dot before a pane's name (and its tab) is blue while it
-  streams output, green when it is done, yellow when it waits for you. Agents that send OSC 9 / 777
-  notifications and shells with OSC 133 prompt marks flip it at once; otherwise 4.5 s of quiet means
-  done and a bell means waiting. Focusing the pane clears it.
-- **Type once, into every pane.** `Ctrl+Alt+B` broadcasts keys and pastes to all panes, with a red
-  frame and a note in the title bar while it is on. `Esc` stops it.
-- **One key, one worktree.** `Ctrl+Alt+N` asks for a branch name, runs
-  `git worktree add ../<repo>-<branch> -b <branch>` for the focused pane's repo (or reuses it), and
-  opens a pane named after the branch in it.
-- **Works out of the box.** Panes start in Windows PowerShell, which every Windows has. The settings
-  page (`Ctrl+Alt+Comma`) switches new panes to PowerShell 7, Command Prompt or Git Bash, whichever
-  are installed. PowerShell and Git Bash panes are named after their folder and come back in it.
+<table>
+<tr>
+<td width="50%" valign="middle">
+
+### The grid builds itself
+`Ctrl+Alt+T` splits the largest pane. Press it three times, get a 2x2. `Alt+arrows` move between panes.
+
+</td>
+<td width="50%"><img src="assets/features/grid.gif" alt="Ctrl+Alt+T builds a 2x2 grid" width="100%"></td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Drag to resize
+Grab any gap between panes and pull. (Windows Terminal has had this
+[open since 2019](https://github.com/microsoft/terminal/issues/992).)
+
+</td>
+<td width="50%"><img src="assets/features/resize.gif" alt="Dragging the gaps between panes" width="100%"></td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Your agents come back
+Close dterm, reopen it: the start page offers the last session, every pane returns to its folder,
+and [Claude Code](https://claude.com/claude-code) resumes its conversation (`claude --resume <id>`).
+aider reloads its chat; codex and opencode restart in the folder. A `[claude]` tag marks the pane.
+
+</td>
+<td width="50%"><img src="assets/features/agents.gif" alt="Closing dterm with Claude Code running, then reopening it" width="100%"></td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### See which pane needs you
+A dot on each background pane: blue while it streams output, green when it is done, yellow when it
+rings the bell or an agent sends a notification (OSC 9 / 777). Looking at the pane clears it.
+
+</td>
+<td width="50%"><img src="assets/features/status.gif" alt="Blue, green and yellow dots on background panes" width="100%"></td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Grid, tabs or zoom
+`Ctrl+Alt+G` flips the same panes between a grid and tabs without touching a shell.
+`Ctrl+Alt+Z` zooms the focused pane to the whole window, and back.
+
+</td>
+<td width="50%"><img src="assets/features/tabs.gif" alt="Switching between grid, tabs and zoom" width="100%"></td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Type once, into every pane
+`Ctrl+Alt+B` broadcasts keys and pastes to all panes, with a red frame while it is on. `Esc` stops it.
+
+</td>
+<td width="50%"><img src="assets/features/broadcast.gif" alt="One command typed into three panes at once" width="100%"></td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### One key, one worktree
+`Ctrl+Alt+N`, type a branch: dterm runs `git worktree add ../<repo>-<branch> -b <branch>` for the
+focused pane's repo and opens a pane in it, named after the branch.
+
+</td>
+<td width="50%"><img src="assets/features/worktree.gif" alt="Ctrl+Alt+N opens a pane in a new git worktree" width="100%"></td>
+</tr>
+<tr>
+<td width="50%" valign="middle">
+
+### Make it yours
+`Ctrl+Alt+Comma`: 5 themes, the acrylic's opacity, the shell for new panes (Windows PowerShell,
+PowerShell 7, Command Prompt, Git Bash) and every shortcut, with keys or the mouse.
+
+</td>
+<td width="50%"><img src="assets/features/settings.gif" alt="Themes, opacity and shell on the settings page" width="100%"></td>
+</tr>
+</table>
+
+**Also in the box:**
+
+- **Works out of the box.** Panes start in Windows PowerShell, which every Windows has; PowerShell and
+  Git Bash panes are named after their folder and come back in it.
 - **Looks like Windows Terminal.** Acrylic that stays on when unfocused, One Half Dark, Cascadia Mono,
-  emoji and symbol fallback, 5 themes (One Half Light among them).
+  emoji and symbol fallback.
+- **Sessions.** `Ctrl+Alt+S` saves the layout under a name; the start page (`Ctrl+Alt+H`) lists them with a preview.
+- **Mouse apps work.** vim, tmux and htop get clicks and drags; `Shift+drag` still selects.
 
-Native Rust, Direct2D and DirectWrite, ConPTY. Panes run Windows PowerShell; the settings page
-switches new panes to PowerShell 7, Command Prompt or Git Bash, whichever are installed.
+Native Rust, Direct2D and DirectWrite, ConPTY.
 
 ### Why dterm vs. heavy agent IDEs?
 
