@@ -6,14 +6,14 @@
 
 <a href="https://github.com/Betadeimos/dterm/stargazers"><img src="https://img.shields.io/github/stars/Betadeimos/dterm" alt="GitHub stars"></a>
 <a href="https://github.com/Betadeimos/dterm/releases"><img src="https://img.shields.io/github/downloads/Betadeimos/dterm/total" alt="GitHub downloads"></a>
-<img src="https://img.shields.io/badge/binary-498_KB-success" alt="Binary size: 498 KB">
+<img src="https://img.shields.io/badge/binary-502_KB-success" alt="Binary size: 502 KB">
 <a href="LICENSE"><img src="https://img.shields.io/github/license/Betadeimos/dterm" alt="License"></a>
 <img src="https://img.shields.io/badge/Windows_10_%7C_11-native_Direct2D-0078D4" alt="Platform: Windows 10 | 11, native Direct2D">
 
-<p><b>The 498 KB Native Terminal Orchestrator for AI Builders.</b><br>
+<p><b>The 502 KB Native Terminal Orchestrator for AI Builders.</b><br>
 <b>Run multiple Claude Code, Codex, OpenCode, or Git Bash sessions side-by-side in an auto-grid — zero Electron, instant start, automatic session restore.</b></p>
 
-<h3><a href="https://github.com/Betadeimos/dterm/releases/latest">Download dterm (498 KB .exe)</a></h3>
+<h3><a href="https://github.com/Betadeimos/dterm/releases/latest">Download dterm (502 KB .exe)</a></h3>
 
 </div>
 
@@ -40,7 +40,7 @@
   `git worktree add ../<repo>-<branch> -b <branch>` for the focused pane's repo (or reuses it), and
   opens a pane named after the branch in it.
 - **Looks like Windows Terminal.** Acrylic that stays on when unfocused, One Half Dark, Cascadia Mono,
-  emoji and symbol fallback, 4 themes.
+  emoji and symbol fallback, 5 themes (One Half Light among them).
 
 Native Rust, Direct2D and DirectWrite, ConPTY. Panes run Git Bash.
 
@@ -48,7 +48,7 @@ Native Rust, Direct2D and DirectWrite, ConPTY. Panes run Git Bash.
 
 | | dterm | Electron/WebGL agent IDEs |
 |---|---|---|
-| Install | ~498 KB single .exe | 200+ MB |
+| Install | ~502 KB single .exe | 200+ MB |
 | RAM | ~15 MB | 500+ MB |
 | Rendering | Pure Direct2D + ConPTY | Chromium + WebGL |
 | Startup | Instant | Seconds |

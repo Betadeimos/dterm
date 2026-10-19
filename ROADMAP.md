@@ -36,6 +36,10 @@ Windows Terminal, but built around the grid.
 - [x] **Mouse reporting to apps:** apps that ask for the mouse (1000 / 1002 / 1003, SGR 1006 or the
   legacy encoding) get left, middle and right presses, drags and releases, with Alt and Ctrl.
   Shift+drag still selects text for dterm.
+- [x] **Polish:** the landing logo reads `D_term`; the settings page has the landing page's
+  footer bar of keys; a One Half Light theme; the default opacity is 80%; new windows open in the
+  middle of the monitor under the mouse; the icon is a dark `D_` on a green tile with a frame for
+  every taskbar size (the dark tile vanished on dark taskbars, and the missing 24 px frame blurred).
 
 ## Feedback round 5 (done in v0.2.2)
 

@@ -52,7 +52,7 @@ use windows::{
             DirectWrite::*,
             Dwm::*,
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-            Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT},
+            Gdi::{BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT},
         },
         System::{
             DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData},
@@ -81,7 +81,7 @@ const MSYSTEMS: [&str; 6] = ["MINGW64", "MINGW32", "MSYS", "UCRT64", "CLANG64", 
 const GAP: f32 = 6.0; // DIPs between panes
 const MIN: f32 = 0.05; // smallest child of a split, as a fraction of it
 const STEP: f32 = 40.0; // DIPs a divider moves per Alt+Shift+arrow
-const OPACITY: f32 = 0.7; // default pane background over the acrylic, like your Windows Terminal profile
+const OPACITY: f32 = 0.8; // default pane background over the acrylic
 const WM_WAKE: u32 = WM_APP; // new terminal output
 const WM_EXIT: u32 = WM_APP + 1; // a shell exited; wparam = pane id
 const SLOP: f32 = 4.0; // DIPs the mouse may move between the clicks of a double-click
@@ -96,8 +96,8 @@ struct Theme {
 }
 
 /// The first is the default: One Half Dark, as in Windows Terminal. The others are Windows
-/// Terminal's Campbell and the Catppuccin Mocha and Dracula schemes.
-const THEMES: [Theme; 4] = [
+/// Terminal's Campbell, the Catppuccin Mocha and Dracula schemes, and One Half Light.
+const THEMES: [Theme; 5] = [
     Theme {
         name: "One Half Dark",
         fg: 0xDCDFE4,
@@ -138,6 +138,16 @@ const THEMES: [Theme; 4] = [
             0x6272A4, 0xFF6E6E, 0x69FF94, 0xFFFFA5, 0xD6ACFF, 0xFF92DF, 0xA4FFFF, 0xFFFFFF,
         ],
     },
+    Theme {
+        name: "One Half Light",
+        fg: 0x383A42,
+        bg: 0xFAFAFA,
+        gap: 0xDCDCDF,
+        ansi: [
+            0x383A42, 0xE45649, 0x50A14F, 0xC18301, 0x0184BC, 0xA626A4, 0x0997B3, 0xFAFAFA,
+            0x4F525D, 0xDF6C75, 0x98C379, 0xE4C07A, 0x61AFEF, 0xC577DD, 0x56B5C1, 0xFFFFFF,
+        ],
+    },
 ];
 
 /// Index into THEMES of the theme in use; a global so that color lookups need no App.
@@ -153,6 +163,12 @@ fn fg() -> Rgb {
 
 fn bg() -> Rgb {
     rgb(theme().bg)
+}
+
+/// Whether the theme in use has a light background.
+fn light() -> bool {
+    let b = bg();
+    b.r as u32 + b.g as u32 + b.b as u32 > 3 * 0x80
 }
 
 const SELECTION_ALPHA: f32 = 0.25; // foreground veil over selected cells
@@ -568,6 +584,13 @@ fn frame_hit((x, y): (i32, i32), (w, h): (i32, i32), border: i32, caption: i32, 
         _ if y < caption && x >= left && x < w - right => HTCAPTION,
         _ => HTCLIENT,
     }
+}
+
+/// Where a `(w, h)` window goes to sit in the middle of a monitor's work area `(x, y, w, h)`:
+/// shrunk to fit it if it is larger. All in pixels.
+fn centered((w, h): (i32, i32), (ax, ay, aw, ah): (i32, i32, i32, i32)) -> (i32, i32, i32, i32) {
+    let (w, h) = (w.min(aw), h.min(ah));
+    (ax + (aw - w) / 2, ay + (ah - h) / 2, w, h)
 }
 
 /// Which caption button is at `x` in a `width` DIPs wide window: 5 settings at the left end, then
@@ -1491,14 +1514,14 @@ fn next_status(now: Status, focused: bool, bell: bool, done: bool, quiet: Option
 }
 
 /// The color of a status dot: blue busy, green done, yellow waiting.
-/// The bright ANSI colors, which stand out on every theme's background.
+/// The bright ANSI colors stand out on a dark background; a light one takes the normal, deeper ones.
 fn status_color(s: Status) -> Option<Rgb> {
-    let t = &theme().ansi;
+    let (t, base) = (&theme().ansi, if light() { 0 } else { 8 });
     match s {
         Status::Idle => None,
-        Status::Busy => Some(rgb(t[12])),
-        Status::Done => Some(rgb(t[10])),
-        Status::Attention => Some(rgb(t[11])),
+        Status::Busy => Some(rgb(t[base + 4])),
+        Status::Done => Some(rgb(t[base + 2])),
+        Status::Attention => Some(rgb(t[base + 3])),
     }
 }
 
@@ -2402,7 +2425,8 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
     if let Ok(big) = text_format(&a.dw, DWRITE_FONT_WEIGHT_BOLD, LOGO_SIZE) {
         let r = rect(LAND_X, LAND_Y, 4000.0, LOGO_SIZE * 1.4);
         text("D_", &big, r, theme().ansi[2], 1.0);
-        text("  term", &big, r, 0xFFFFFF, 1.0); // monospace: right after the two cells of "D_"
+        // Monospace: right after the two cells of "D_". White, or the text color on a light theme.
+        text("  term", &big, r, if light() { theme().fg } else { 0xFFFFFF }, 1.0);
     }
     let tagline = format!("terminals in a grid, sessions that come back  \u{b7}  v{}", env!("CARGO_PKG_VERSION"));
     let live = l.rows.iter().any(|r| r.kind == Kind::Live);
@@ -4257,6 +4281,16 @@ fn main() {
         // force a recalc so WM_NCCALCSIZE drops it on every version, not just after the first resize.
         let flags = SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
         let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, flags);
+        // Windows' default spot cascades from the top-left; start in the middle of the monitor
+        // under the mouse (where the taskbar or Start menu was clicked) instead, at the default size.
+        let (mut wr, mut cursor) = (RECT::default(), POINT::default());
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let _ = GetCursorPos(&mut cursor);
+        if GetWindowRect(hwnd, &mut wr).is_ok() && GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            let a = info.rcWork;
+            let (x, y, w, h) = centered((wr.right - wr.left, wr.bottom - wr.top), (a.left, a.top, a.right - a.left, a.bottom - a.top));
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
 
         // With a last or saved session, start on the landing page; otherwise straight in a new one.
         let rows = data_dir().map(|d| landing_rows(&d, &ago)).unwrap_or_default();
@@ -4704,6 +4738,13 @@ fn check() {
     assert_eq!((at(0.0, true), at(45.0, true), at(46.0, true), at(92.0, true), at(138.0, true)), (Some(5), Some(5), Some(0), Some(1), None));
     assert_eq!((at(10.0, false), at(60.0, false)), (Some(5), None));
     assert_eq!((caption_x(5, 800.0), caption_x(0, 800.0), caption_x(1, 800.0), caption_x(2, 800.0), caption_x(4, 800.0)), (0.0, 46.0, 92.0, 662.0, 754.0));
+    // A new window sits in the middle of the work area, shrunk to fit it.
+    assert_eq!(centered((1000, 600), (0, 0, 1920, 1040)), (460, 220, 1000, 600));
+    assert_eq!(centered((1000, 600), (-1920, 100, 1920, 1080)), (-1460, 340, 1000, 600)); // a monitor on the left
+    assert_eq!(centered((3000, 2000), (0, 0, 1920, 1040)), (0, 0, 1920, 1040));
+    // Defaults: One Half Dark at 80%; One Half Light is there too, read back by name.
+    assert_eq!((Settings::default().theme, Settings::default().opacity), (0, 0.8));
+    assert_eq!(parse_settings("theme one half light\n").theme, THEMES.len() - 1);
     // Tooltips read the current shortcuts.
     let mut keys = Settings::default().keys;
     assert_eq!(caption_tip(5, View::Grid, false, &keys), ("Settings", Some("Ctrl+Alt+Comma".into())));
