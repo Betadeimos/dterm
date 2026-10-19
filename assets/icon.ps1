@@ -20,12 +20,23 @@ $frames = foreach ($s in 256, 64, 48, 40, 32, 24, 20, 16) {
     $path.AddArc(0, $s - 2 * $r - 1, 2 * $r, 2 * $r, 90, 90)
     $path.CloseFigure()
     $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0x98, 0xC3, 0x79))), $path)  # One Half Dark green
-    # The text fills 60% of the tile, centered by its typographic box.
-    $font = New-Object System.Drawing.Font 'Cascadia Mono', ($s * 0.6), ([System.Drawing.FontStyle]::Bold), ([System.Drawing.GraphicsUnit]::Pixel)
-    $fmt = [System.Drawing.StringFormat]::GenericTypographic
-    $w = $g.MeasureString($Text, $font, 10000, $fmt).Width
+    # The text is an outline path, thickened by a stroke and fitted by its ink bounds into a square
+    # with the same margin on every side (so it is centered by what you see, not by the font box).
+    $glyphs = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $glyphs.AddString($Text, (New-Object System.Drawing.FontFamily 'Cascadia Mono'), [int][System.Drawing.FontStyle]::Bold, 100, (New-Object System.Drawing.PointF 0, 0), [System.Drawing.StringFormat]::GenericTypographic)
+    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::Black), 7
+    $pen.LineJoin = 'Round'
+    $b = $glyphs.GetBounds($null, $pen)
+    $m = $s * 0.22; $box = $s - 2 * $m
+    $fit = New-Object System.Drawing.Drawing2D.Matrix
+    $fit.Translate($m, $m)
+    $fit.Scale($box / $b.Width, $box / $b.Height)
+    $fit.Translate(-$b.X, -$b.Y)
+    $g.Transform = $fit
     $dark = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0x1B, 0x1D, 0x23))  # One Half Dark gap color
-    $g.DrawString($Text, $font, $dark, (($s - $w) / 2), (($s - $font.GetHeight($g)) / 2), $fmt)
+    $pen.Color = $dark.Color
+    $g.FillPath($dark, $glyphs); $g.DrawPath($pen, $glyphs)
+    $g.ResetTransform()
     if ($s -eq 256 -and $Out -eq 'icon.ico') { $bm.Save((Join-Path $PSScriptRoot 'icon.png'), [System.Drawing.Imaging.ImageFormat]::Png) }
     $ms = New-Object System.IO.MemoryStream
     $bm.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
