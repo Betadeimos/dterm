@@ -178,7 +178,7 @@ AltGr+key types a character on your layout, that character wins, and left Ctrl +
 | `Alt+Shift+Arrows` | Resize the focused pane (grid) |
 | `Ctrl+Alt+Arrows` | Swap the focused pane with its neighbor (grid) |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous pane or tab |
-| `Ctrl+Alt+1` … `9` | Go to pane or tab N, in tab order (in zoom: show it zoomed) |
+| `Ctrl+Alt+1` … `9` | Go to pane or tab N, in tab order (in zoom: show it zoomed); hold `Ctrl+Alt` to see the numbers |
 | Drag a gap | Resize panes |
 
 ### Sessions and settings
