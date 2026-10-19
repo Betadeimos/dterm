@@ -2458,10 +2458,16 @@ unsafe fn paint(hwnd: HWND) {
                 brush.SetColor(&color(bg(), VEIL_ALPHA));
                 rt.FillRectangle(&r, brush);
             }
+            // Ctrl+Alt held: the pane's number for Ctrl+Alt+N, at the end of its label or on a badge.
+            let num = order.iter().position(|&id| id == p.id).filter(|&n| n < 9).map(|n| n + 1);
             if labeled {
                 let (text, alpha) = match a.rename.as_ref().filter(|r| r.0 == p.id) {
                     Some((_, typed)) => (format!("{typed}\u{258f}"), 1.0), // the name being typed, with a caret
-                    None => (p.label(a.home.as_deref()), if focused { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }),
+                    None => {
+                        let label = p.label(a.home.as_deref());
+                        let text = num.map_or(label.clone(), |n| format!("{label}   {n}"));
+                        (text, if focused || num.is_some() { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA })
+                    }
                 };
                 let mut dx = 0.0;
                 if let Some(c) = status_color(p.status).filter(|_| a.rename.is_none()) {
@@ -2473,14 +2479,15 @@ unsafe fn paint(hwnd: HWND) {
                 let slot = rect(x + PAD + dx, y, (pw - 2.0 * PAD - dx).max(0.0), LABEL_TOP);
                 rt.DrawText(&units, &a.label, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
             }
-            // Ctrl+Alt held: the pane's number for Ctrl+Alt+N, on a badge in its top-right corner.
-            if let Some(n) = order.iter().position(|&id| id == p.id).filter(|&n| n < 9) {
+            // A pane without a label (Zoom, a lone pane) gets its number on a badge in the top-right corner.
+            if let Some(n) = num.filter(|_| !labeled) {
                 let badge = rect(x + pw - PAD - BADGE_W, y + 2.0, BADGE_W, LABEL_TOP - 4.0);
                 brush.SetColor(&color(bg(), 0.95));
                 rt.FillRoundedRectangle(&D2D1_ROUNDED_RECT { rect: badge, radiusX: 4.0, radiusY: 4.0 }, brush);
                 brush.SetColor(&color(fg(), 1.0));
-                let units: Vec<u16> = (n + 1).to_string().encode_utf16().collect();
-                let slot = rect(x + pw - PAD - BADGE_W + 7.0, y, BADGE_W, LABEL_TOP);
+                let units: Vec<u16> = n.to_string().encode_utf16().collect();
+                // The label format is right-aligned: the slot's right edge sits inside the badge.
+                let slot = rect(x + pw - PAD - BADGE_W, y, BADGE_W - 7.0, LABEL_TOP);
                 rt.DrawText(&units, &a.label, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
             }
             rt.PopAxisAlignedClip();
