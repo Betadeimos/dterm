@@ -6,15 +6,21 @@
 //! focused one side by side / top and bottom, Ctrl+Alt+W (or `exit`) closes a pane, Ctrl+Alt+R
 //! renames it (Enter confirms, Esc cancels, empty resets), Ctrl+Alt+Z zooms it to the whole window,
 //! Ctrl+Alt+G shows the panes as tabs (also the button in the title bar), Ctrl+Alt+S saves the
-//! session under a name, Ctrl+Alt+H goes to the start page (the ≡ button next to it) and Ctrl+Alt+Comma opens the settings (theme, opacity, shortcuts).
+//! session under a name, Ctrl+Alt+H goes to the start page (the ≡ button next to it) and Ctrl+Alt+Comma opens the settings (theme, opacity, shortcuts;
+//! keys or mouse). Ctrl+Alt+B broadcasts typing and pastes to every pane (Esc or Ctrl+Alt+B stops), Ctrl+Alt+N asks for a
+//! branch and opens a git worktree of the focused pane's repo (`../<repo>-<branch>`) in a new pane.
 //! AltGr+key still types its character where the keyboard layout has one.
 //! Fixed keys: Alt+arrows move the focus, Alt+Shift+arrows resize, Ctrl+Alt+arrows swap panes, drag
 //! the gaps to resize, Ctrl+Tab / Ctrl+Shift+Tab go to the next / previous pane. Select with the
 //! mouse or Shift+arrows (Ctrl+Shift+Left / Right by word), copy with Ctrl+C (or right-click),
 //! Ctrl+V pastes plain text, the wheel scrolls back, Ctrl+Plus / Minus / 0 / wheel set the font size.
-//! Closing the window remembers the session (layout, folders, names, view, font, and the Claude Code
-//! conversation of each pane that runs one); with anything saved, dterm starts on a landing page
-//! to pick a session or a new one.
+//! Apps that ask for the mouse (vim, tmux, htop) get clicks and drags; Shift+drag still selects.
+//! A dot before a background pane's name shows its status: blue busy, green done (quiet for 4.5 s,
+//! or an OSC 133 prompt after a command), yellow waiting (a bell, or an OSC 9 / 777 notification).
+//! Panes running claude, codex, opencode or aider show the agent as a tag.
+//! Closing the window remembers the session (layout, folders, names, view, font, and the coding
+//! agent of each pane that runs one, Claude Code with its conversation); with anything saved,
+//! dterm starts on a landing page to pick a session or a new one.
 
 use std::{
     borrow::Cow,
@@ -55,7 +61,10 @@ use windows::{
             Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
             Ole::CF_UNICODETEXT,
             Registry::*,
-            Threading::{GetProcessTimes, OpenProcess, Sleep, PROCESS_QUERY_LIMITED_INFORMATION},
+            Threading::{
+                CreateProcessW, GetExitCodeProcess, GetProcessTimes, OpenProcess, Sleep, WaitForSingleObject, CREATE_NO_WINDOW,
+                INFINITE, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+            },
             Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
         },
         UI::{Controls::{MARGINS, WM_MOUSELEAVE}, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
@@ -172,6 +181,8 @@ const TOAST_TIMER: usize = 1; // hides the "saved" note
 const STATUS_TIMER: usize = 2; // runs while a pane is busy, to notice when it goes quiet
 const BUSY_MS: u64 = 4500; // output within this long ago counts as busy; a thinking pause is shorter
 const STATUS_TICK: u32 = 400; // ms between checks while a pane is busy
+const AGENT_TIMER: usize = 3; // looks for coding agents in the panes' process trees
+const AGENT_TICK: u32 = 2000; // ms between looks
 const DOT_R: f32 = 4.0; // DIPs, radius of the status dot before a name (8 across)
 const DOT_GAP: f32 = 14.0; // DIPs the name moves right to make room for the dot
 
@@ -629,11 +640,13 @@ enum Action {
     Tabs,
     Home,
     Settings,
+    Broadcast,
+    Worktree,
 }
 
 /// Each action's id in the settings file, its name on the settings page, and its default keys.
 /// The settings page lists them in this order.
-const ACTIONS: [(Action, &str, &str, &str); 10] = [
+const ACTIONS: [(Action, &str, &str, &str); 12] = [
     (Action::NewPane, "new-pane", "New pane", "Ctrl+Alt+T"),
     (Action::SplitRight, "split-right", "Split right", "Ctrl+Alt+Plus"),
     (Action::SplitDown, "split-down", "Split below", "Ctrl+Alt+Minus"),
@@ -644,6 +657,8 @@ const ACTIONS: [(Action, &str, &str, &str); 10] = [
     (Action::Tabs, "grid-tabs", "Grid / tabs", "Ctrl+Alt+G"),
     (Action::Home, "start-page", "Start page", "Ctrl+Alt+H"),
     (Action::Settings, "settings", "Settings", "Ctrl+Alt+Comma"),
+    (Action::Broadcast, "broadcast", "Broadcast input", "Ctrl+Alt+B"),
+    (Action::Worktree, "worktree-pane", "Worktree pane", "Ctrl+Alt+N"),
 ];
 
 /// A key with modifiers.
@@ -785,11 +800,12 @@ struct Session {
     closed: u64,
 }
 
-/// Whether `run` is a command dterm itself would save: `claude` alone, or resuming one Claude Code
-/// conversation by its id. Session files are plain text, so nothing else is ever run from them.
+/// Whether `run` is a command dterm itself would save (see `agent_run`): an agent alone, aider
+/// with its chat history, or resuming one Claude Code conversation by its id. Session files are
+/// plain text, so nothing else is ever run from them.
 fn resume_command(run: &str) -> bool {
     let id_ok = |id: &str| !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
-    run == "claude" || run.strip_prefix("claude --resume ").is_some_and(id_ok)
+    matches!(run, "claude" | "codex" | "opencode" | "aider --restore-chat-history") || run.strip_prefix("claude --resume ").is_some_and(id_ok)
 }
 
 fn now() -> u64 {
@@ -1200,6 +1216,25 @@ fn wheel_input(mode: TermMode, delta: i32, (col, row): (usize, usize)) -> Option
     }
 }
 
+/// What a mouse button event sends to an app that asked for the mouse (modes 1000 / 1002 / 1003,
+/// SGR 1006 or the legacy encoding), or `None` when it did not ask for this one. `button` is 0
+/// left, 1 middle, 2 right; `press` false is the release; `drag` a move with the button held;
+/// `mods` the xterm bits (8 Alt, 16 Ctrl); `(col, row)` the 0-based cell.
+fn mouse_report(mode: TermMode, button: u8, press: bool, drag: bool, mods: u8, (col, row): (usize, usize)) -> Option<Vec<u8>> {
+    let wanted = if drag { TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION } else { TermMode::MOUSE_MODE };
+    if !mode.intersects(wanted) {
+        return None;
+    }
+    let (c, r) = (col + 1, row + 1);
+    let code = button + mods + if drag { 32 } else { 0 };
+    Some(if mode.contains(TermMode::SGR_MOUSE) {
+        format!("\x1b[<{code};{c};{r}{}", if press { 'M' } else { 'm' }).into_bytes()
+    } else {
+        let code = if press { code } else { 3 + mods }; // the legacy release names no button
+        vec![0x1b, b'[', b'M', 32 + code, (32 + c).min(255) as u8, (32 + r).min(255) as u8]
+    })
+}
+
 /// Clipboard form of selected text: UTF-16, CRLF line breaks, NUL-terminated.
 fn clip_units(text: &str) -> Vec<u16> {
     wide(&text.replace('\n', "\r\n"))
@@ -1266,6 +1301,15 @@ fn pick_name(custom: Option<&str>, n: &Names, home: Option<&str>) -> Option<Stri
     custom.or(n.app.as_deref()).map(String::from).or_else(folder)
 }
 
+/// A pane label with its agent's tag in front: "[claude] proj".
+fn tagged(agent: Option<&str>, name: Option<String>) -> String {
+    match (agent, name) {
+        (Some(a), Some(n)) => format!("[{a}] {n}"),
+        (Some(a), None) => format!("[{a}]"),
+        (None, n) => n.unwrap_or_default(),
+    }
+}
+
 /// Window title for the focused pane's name.
 fn window_title(session: Option<&str>) -> String {
     format!("dterm \u{2014} {}", session.unwrap_or("untitled"))
@@ -1285,7 +1329,147 @@ enum Status {
 #[derive(Default)]
 struct Activity {
     output: AtomicU64, // `uptime()` of the last output, plus one; 0 = none yet
-    bell: AtomicBool,
+    bell: AtomicBool,  // also set by OSC 9 / 777 notifications
+    done: AtomicBool,  // OSC 133: a command finished and the prompt is back
+}
+
+impl Activity {
+    /// Take in what an OSC sequence said. `ran`: a command started since the last prompt, so
+    /// the next prompt (or finished mark) means it is done.
+    fn signal(&self, s: Signal, ran: &mut bool) {
+        match s {
+            Signal::Notify => self.bell.store(true, Ordering::Relaxed),
+            Signal::Running => {
+                *ran = true;
+                self.done.store(false, Ordering::Relaxed);
+            }
+            Signal::Prompt | Signal::Finished if std::mem::take(ran) => self.done.store(true, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+}
+
+/// What an OSC sequence tells about a pane: a desktop notification (OSC 9 or 777), or a shell
+/// integration mark (OSC 133): prompt shown, command started, command finished.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Signal {
+    Notify,
+    Prompt,
+    Running,
+    Finished,
+}
+
+/// The signal in an OSC payload (the bytes between `ESC ]` and the terminator), if any.
+fn osc_signal(p: &[u8]) -> Option<Signal> {
+    let (code, rest) = match p.iter().position(|&b| b == b';') {
+        Some(i) => (&p[..i], &p[i + 1..]),
+        None => (p, &[][..]),
+    };
+    match code {
+        // ConEmu's OSC 9;<number> commands (progress, folder, ...) are not notifications.
+        b"9" => {
+            let first = rest.split(|&b| b == b';').next().unwrap_or_default();
+            (!rest.is_empty() && !(!first.is_empty() && first.iter().all(u8::is_ascii_digit))).then_some(Signal::Notify)
+        }
+        b"777" => rest.starts_with(b"notify").then_some(Signal::Notify),
+        b"133" => match rest.first() {
+            Some(b'A') => Some(Signal::Prompt),
+            Some(b'C') => Some(Signal::Running),
+            Some(b'D') => Some(Signal::Finished),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Finds OSC sequences in a pane's raw output, also when one is split across reads. Only the
+/// start of each payload is kept: enough to tell the signals apart.
+#[derive(Default)]
+struct OscScan {
+    state: u8, // 0 text, 1 after ESC, 2 in an OSC, 3 after ESC in an OSC
+    buf: Vec<u8>,
+}
+
+impl OscScan {
+    fn feed(&mut self, bytes: &[u8], mut f: impl FnMut(Signal)) {
+        for &b in bytes {
+            self.state = match (self.state, b) {
+                (2 | 3, 0x07) | (3, b'\\') => {
+                    osc_signal(&self.buf).map(&mut f);
+                    0
+                }
+                (2, 0x1b) => 3,
+                (2, 0x18 | 0x1a) => 0, // CAN, SUB abort it
+                (2, _) => {
+                    if self.buf.len() < 32 {
+                        self.buf.push(b);
+                    }
+                    2
+                }
+                (_, 0x1b) => 1,
+                (1 | 3, b']') => {
+                    self.buf.clear();
+                    2
+                }
+                _ => 0,
+            };
+        }
+    }
+}
+
+/// A pane's PTY whose output passes an `OscScan` on its way to the terminal, which drops these
+/// sequences unseen.
+struct Tapped {
+    pty: tty::Pty,
+    scan: OscScan,
+    ran: bool, // see `Activity::signal`
+    activity: Arc<Activity>,
+}
+
+impl std::io::Read for Tapped {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = tty::EventedReadWrite::reader(&mut self.pty).read(buf)?;
+        let (activity, ran) = (&self.activity, &mut self.ran);
+        self.scan.feed(&buf[..n], |s| activity.signal(s, ran));
+        Ok(n)
+    }
+}
+
+impl tty::EventedReadWrite for Tapped {
+    type Reader = Self;
+    type Writer = <tty::Pty as tty::EventedReadWrite>::Writer;
+
+    unsafe fn register(&mut self, p: &Arc<polling::Poller>, e: polling::Event, m: polling::PollMode) -> std::io::Result<()> {
+        self.pty.register(p, e, m)
+    }
+
+    fn reregister(&mut self, p: &Arc<polling::Poller>, e: polling::Event, m: polling::PollMode) -> std::io::Result<()> {
+        self.pty.reregister(p, e, m)
+    }
+
+    fn deregister(&mut self, p: &Arc<polling::Poller>) -> std::io::Result<()> {
+        self.pty.deregister(p)
+    }
+
+    fn reader(&mut self) -> &mut Self {
+        self
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.pty.writer()
+    }
+}
+
+impl tty::EventedPty for Tapped {
+    fn next_child_event(&mut self) -> Option<tty::ChildEvent> {
+        self.pty.next_child_event()
+    }
+}
+
+impl alacritty_terminal::event::OnResize for Tapped {
+    fn on_resize(&mut self, size: WindowSize) {
+        self.pty.on_resize(size)
+    }
 }
 
 fn uptime() -> u64 {
@@ -1293,11 +1477,13 @@ fn uptime() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-/// The next status of a pane. `quiet` is the time since its last output, if it ever had any.
-fn next_status(now: Status, focused: bool, bell: bool, quiet: Option<u64>) -> Status {
+/// The next status of a pane. `quiet` is the time since its last output, if it ever had any;
+/// `done` means OSC 133 said its command finished, which wins over the quiet timer.
+fn next_status(now: Status, focused: bool, bell: bool, done: bool, quiet: Option<u64>) -> Status {
     match (now, focused, bell) {
         (_, true, _) => Status::Idle,
         (_, _, true) | (Status::Attention, _, _) => Status::Attention,
+        _ if done => Status::Done,
         _ if quiet.is_some_and(|q| q < BUSY_MS) => Status::Busy,
         (Status::Busy | Status::Done, _, _) => Status::Done,
         _ => Status::Idle,
@@ -1381,6 +1567,7 @@ struct Pane {
     pid: Option<u32>,           // the shell's process
     activity: Arc<Activity>,
     status: Status,             // shown while the pane is not focused
+    agent: Option<&'static str>, // coding agent running in it, see `sync_agents`
 }
 
 impl Pane {
@@ -1412,14 +1599,18 @@ impl Pane {
         locate(m, self.origin, cell, self.size, term.grid().display_offset())
     }
 
-    /// Re-reads the activity; true if the status changed. A bell on the focused pane is dropped.
+    /// Re-reads the activity; true if the status changed. A bell or finished command on the
+    /// focused pane is dropped.
     fn refresh_status(&mut self, focused: bool, now: u64) -> bool {
-        let bell = !focused && self.activity.bell.load(Ordering::Relaxed);
-        if focused {
-            self.activity.bell.store(false, Ordering::Relaxed);
-        }
+        let take = |f: &AtomicBool| {
+            if focused {
+                f.store(false, Ordering::Relaxed);
+            }
+            !focused && f.load(Ordering::Relaxed)
+        };
+        let (bell, done) = (take(&self.activity.bell), take(&self.activity.done));
         let quiet = self.activity.output.load(Ordering::Relaxed).checked_sub(1).map(|t| now.saturating_sub(t));
-        let next = next_status(self.status, focused, bell, quiet);
+        let next = next_status(self.status, focused, bell, done, quiet);
         std::mem::replace(&mut self.status, next) != next
     }
 
@@ -1427,6 +1618,11 @@ impl Pane {
     fn name(&self, home: Option<&str>) -> Option<String> {
         let names = self.names.lock().ok()?;
         pick_name(self.custom.as_deref(), &names, home)
+    }
+
+    /// The label with the tag of the agent running in the pane, if any.
+    fn label(&self, home: Option<&str>) -> String {
+        tagged(self.agent, self.name(home))
     }
 
     /// Shift+arrows: move the selection's free end by a character or a line, starting at the cursor.
@@ -1497,13 +1693,23 @@ struct App {
     mouse: Option<(f32, f32)>,   // last mouse position in DIPs; None once it left the window
     tracking: bool,              // WM_MOUSELEAVE is requested
     landing: Option<Landing>,    // the start page, shown before any pane exists
-    prompt: Option<String>,      // session name being typed for the save-session shortcut
+    prompt: Option<(Ask, String)>, // what is asked near the bottom, and the answer being typed
     toast: Option<String>,       // short note after saving
     created: u64,                // when this session started (Unix seconds), kept across restores
     file: Option<std::path::PathBuf>, // the saved session this window is; Save writes over it
     settings: Settings,
     page: Option<SettingsPage>,  // the settings page, shown over the panes or the landing page
     seen: bool,                  // the user has clicked or typed since the window was last deactivated; until then the focused pane counts as background
+    broadcast: bool,             // typing and pasting go to every pane
+    report: Option<(usize, u8, Point)>, // a button reported to the app in pane id: the button, the last cell sent
+}
+
+/// What the one-line prompt near the bottom asks for: a name to save the session under, or the
+/// branch of a new worktree pane.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Ask {
+    Save,
+    Worktree,
 }
 
 /// The settings page: the selected row (theme, opacity, then one per action) and whether it waits
@@ -1559,7 +1765,7 @@ impl App {
             .map(|id| {
                 let p = self.panes.iter().find(|p| p.id == *id);
                 let cwd = p.and_then(|p| p.names.lock().ok()?.win.clone()).unwrap_or_default();
-                let run = p.and_then(|p| claude_run(&procs, p.pid?, &cwd, &mut taken)).unwrap_or_default();
+                let run = p.and_then(|p| agent_run(&procs, p.pid?, &cwd, &mut taken)).unwrap_or_default();
                 SavedPane { cwd, name: p.and_then(|p| p.custom.clone()).unwrap_or_default(), run }
             })
             .collect();
@@ -1567,6 +1773,21 @@ impl App {
         let focus = order.iter().position(|&i| Some(i) == focused).unwrap_or(0);
         let tree = tree.numbered(&mut 0);
         Some(Session { view: self.view, font: self.font_size, focus, tree, panes, created: self.created, closed: now() })
+    }
+
+    /// Typed or pasted input for the focused pane, or for every pane while broadcasting. `make`
+    /// builds the bytes from a pane's terminal mode (cursor keys and pastes depend on it).
+    fn type_in(&mut self, make: impl Fn(TermMode) -> Option<Vec<u8>>) -> bool {
+        let (all, focus) = (self.broadcast, self.focus);
+        let mut sent = false;
+        for (_, p) in self.panes.iter_mut().enumerate().filter(|(i, _)| all || *i == focus) {
+            let mode = *p.term.lock().mode();
+            if let Some(bytes) = make(mode) {
+                p.input(bytes);
+                sent = true;
+            }
+        }
+        sent
     }
 
     /// Move the focus `step` panes along the tree order, wrapping.
@@ -1617,14 +1838,14 @@ unsafe fn processes() -> Vec<(u32, u32, String)> {
     out
 }
 
-/// A process named `name` (any case) among the descendants of process `root`.
-fn descendant(procs: &[(u32, u32, String)], root: u32, name: &str) -> Option<u32> {
+/// The nearest process among the descendants of process `root` whose exe name passes `hit`.
+fn descendant(procs: &[(u32, u32, String)], root: u32, hit: impl Fn(&str) -> bool) -> Option<u32> {
     let mut seen = vec![root]; // also guards against loops from reused pids
     let mut i = 0;
     while let Some(&parent) = seen.get(i) {
         for (pid, ppid, exe) in procs {
             if *ppid == parent && !seen.contains(pid) {
-                if exe.eq_ignore_ascii_case(name) {
+                if hit(exe) {
                     return Some(*pid);
                 }
                 seen.push(*pid);
@@ -1673,11 +1894,33 @@ fn recent_conversations(dir: &std::path::Path, since: u64) -> Vec<String> {
     found.into_iter().map(|f| f.1).collect()
 }
 
-/// The command that brings back Claude Code if it runs under shell process `shell` in `cwd`: its
-/// newest conversation that no other pane has `taken`, or a fresh `claude` when it has none yet.
+/// The coding agents dterm knows: shown as a tag on their pane and brought back with the session.
+const AGENTS: [&str; 4] = ["claude", "codex", "opencode", "aider"];
+
+/// The agent an exe name belongs to: `claude.exe`, or a native build like `codex-x86_64-pc-windows-msvc.exe`.
+fn agent_of(exe: &str) -> Option<&'static str> {
+    let exe = exe.to_ascii_lowercase();
+    let stem = exe.strip_suffix(".exe")?;
+    AGENTS.into_iter().find(|a| stem.strip_prefix(a).is_some_and(|r| r.is_empty() || r.starts_with('-')))
+}
+
+/// The nearest coding agent under shell process `shell`: its pid and name.
+fn agent(procs: &[(u32, u32, String)], shell: u32) -> Option<(u32, &'static str)> {
+    let pid = descendant(procs, shell, |e| agent_of(e).is_some())?;
+    procs.iter().find(|p| p.0 == pid).and_then(|p| agent_of(&p.2)).map(|a| (pid, a))
+}
+
+/// The command that brings back the agent running under shell process `shell` in `cwd`. Claude
+/// Code resumes its newest conversation that no other pane has `taken` (or starts fresh when it
+/// has none yet), aider reloads its chat history, codex and opencode start again in the folder.
 // ponytail: two Claude panes in one folder may swap conversations; matching by open file handles would pin them.
-fn claude_run(procs: &[(u32, u32, String)], shell: u32, cwd: &str, taken: &mut Vec<String>) -> Option<String> {
-    let pid = descendant(procs, shell, "claude.exe")?;
+fn agent_run(procs: &[(u32, u32, String)], shell: u32, cwd: &str, taken: &mut Vec<String>) -> Option<String> {
+    let (pid, name) = agent(procs, shell)?;
+    if name == "aider" {
+        return Some("aider --restore-chat-history".into());
+    } else if name != "claude" {
+        return Some(name.into());
+    }
     let since = unsafe { started(pid) }.unwrap_or(0);
     let ids = claude_project(cwd).map(|d| recent_conversations(&d, since)).unwrap_or_default();
     Some(match ids.into_iter().find(|id| !taken.contains(id)) {
@@ -1710,18 +1953,18 @@ fn spawn(hwnd: HWND, id: usize, bash: &str, cell: (f32, f32), scale: f32, dir: O
         env: Default::default(),
         escape_args: true,
     };
-    let pty = tty::new(&opts, window_size(size, cell, scale), 0)?;
-    let pid = pty.child_watcher().pid().map(|p| p.get());
+    let activity = Arc::new(Activity::default());
+    let pty = Tapped { pty: tty::new(&opts, window_size(size, cell, scale), 0)?, scan: OscScan::default(), ran: false, activity: activity.clone() };
+    let pid = pty.pty.child_watcher().pid().map(|p| p.get());
     let slot = Arc::new(OnceLock::new());
     let names = Arc::new(Mutex::new(Names::default()));
-    let activity = Arc::new(Activity::default());
     let proxy = Proxy { hwnd: hwnd.0 as isize, id, tx: slot.clone(), names: names.clone(), activity: activity.clone() };
     let term = Arc::new(FairMutex::new(Term::new(Config::default(), &TermSize::new(size.0, size.1), proxy.clone())));
     let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)?;
     let tx = event_loop.channel();
     let _ = slot.set(tx.clone());
     event_loop.spawn();
-    Ok(Pane { id, term, tx, size, rect: (0.0, 0.0, 0.0, 0.0), origin: (PAD, PAD), head: None, names, custom: None, pid, activity, status: Status::Idle })
+    Ok(Pane { id, term, tx, size, rect: (0.0, 0.0, 0.0, 0.0), origin: (PAD, PAD), head: None, names, custom: None, pid, activity, status: Status::Idle, agent: None })
 }
 
 unsafe fn scale(hwnd: HWND) -> f32 {
@@ -1794,11 +2037,16 @@ unsafe fn layout(hwnd: HWND) {
 /// Open a shell in a new pane that gets the focus. `Some(side_by_side)` splits the focused pane
 /// that way; `None` splits the largest one along its longer side (and starts the first pane).
 unsafe fn add_pane(hwnd: HWND, dir: Option<bool>) {
+    add_pane_in(hwnd, dir, None);
+}
+
+/// `add_pane` with the shell started in folder `cwd` (the home folder when `None`). True when it started.
+unsafe fn add_pane_in(hwnd: HWND, dir: Option<bool>, cwd: Option<&str>) -> bool {
     let s = scale(hwnd);
     let added = with(|a| {
         let id = a.next_id;
         a.next_id += 1;
-        let Ok(p) = spawn(hwnd, id, &a.bash, a.cell, s, None) else { return false };
+        let Ok(p) = spawn(hwnd, id, &a.bash, a.cell, s, cwd) else { return false };
         let (at, side_by_side) = match dir {
             Some(d) => (a.focus, d),
             None => auto_split(&a.panes.iter().map(|p| p.rect).collect::<Vec<_>>(), a.focus),
@@ -1819,6 +2067,7 @@ unsafe fn add_pane(hwnd: HWND, dir: Option<bool>) {
     } else if with(|a| !a.panes.is_empty()) {
         toast(hwnd, "could not start Git Bash".into()); // with no panes, the callers say so
     }
+    added
 }
 
 /// Close pane `id`: its sibling takes the room, and the focus moves there if it was on `id`.
@@ -1867,6 +2116,14 @@ unsafe fn draw_caption(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCo
     // Centered in the window, clear of the buttons on both sides.
     let slot = rect(3.0 * CAPTION_BTN, 0.0, (width - 6.0 * CAPTION_BTN).max(0.0), CAPTION_H);
     rt.DrawText(&units, &a.tab, &slot, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+    // Broadcasting: a red note right of the left buttons, so it is never on by accident.
+    if a.broadcast && session_shown(a) {
+        let keys = a.settings.keys[Action::Broadcast as usize].map_or("Esc".into(), |k| format!("Esc or {}", chord_text(k)));
+        let units: Vec<u16> = format!("\u{25cf} BROADCAST \u{b7} {keys} stops").encode_utf16().collect();
+        brush.SetColor(&color(rgb(theme().ansi[9]), 1.0));
+        let x = left_buttons(true) * CAPTION_BTN + 4.0;
+        rt.DrawText(&units, &a.tab, &rect(x, 0.0, 260.0, CAPTION_H), brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
+    }
     for i in [5, 0, 1, 2, 3, 4].into_iter().filter(|&i| i > 1 || session_shown(a)) {
         let x = caption_x(i, width);
         if a.cap_hot == Some(i) {
@@ -2070,8 +2327,12 @@ unsafe fn paint(hwnd: HWND) {
             rt.PushAxisAlignedClip(&r, D2D1_ANTIALIAS_MODE_ALIASED);
             rt.Clear(Some(&color(bg(), a.settings.opacity)));
             draw_term(rt, brush, &a.format, &a.bold, a.cell, p.origin, focused, &p.term.lock());
-            // Several panes: a faint border marks the focused one, a veil dims the others.
-            if several && focused {
+            // Several panes: a faint border marks the focused one, a veil dims the others. While
+            // broadcasting, every pane gets a red frame instead: typing goes to all of them.
+            if a.broadcast {
+                brush.SetColor(&color(rgb(theme().ansi[9]), 0.9));
+                rt.DrawRectangle(&rect(x + 1.0, y + 1.0, pw - 2.0, ph - 2.0), brush, 2.0, None);
+            } else if several && focused {
                 brush.SetColor(&color(fg(), FOCUS_ALPHA));
                 rt.DrawRectangle(&rect(x + 0.5, y + 0.5, pw - 1.0, ph - 1.0), brush, 1.0, None);
             } else if several {
@@ -2081,7 +2342,7 @@ unsafe fn paint(hwnd: HWND) {
             if labeled {
                 let (text, alpha) = match a.rename.as_ref().filter(|r| r.0 == p.id) {
                     Some((_, typed)) => (format!("{typed}\u{258f}"), 1.0), // the name being typed, with a caret
-                    None => (p.name(a.home.as_deref()).unwrap_or_default(), if focused { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }),
+                    None => (p.label(a.home.as_deref()), if focused { LABEL_FOCUS_ALPHA } else { LABEL_ALPHA }),
                 };
                 let mut dx = 0.0;
                 if let Some(c) = status_color(p.status).filter(|_| a.rename.is_none()) {
@@ -2096,8 +2357,9 @@ unsafe fn paint(hwnd: HWND) {
             rt.PopAxisAlignedClip();
         }
         draw_chrome(a, rt, brush, w as f32 / s);
-        // The save-session prompt, or the note after saving: one small line near the bottom.
-        let note = a.prompt.as_ref().map(|t| (format!("save session as: {t}\u{258f}"), 0.9)).or(a.toast.clone().map(|t| (t, 0.6)));
+        // The save-session or worktree prompt, or the note after saving: one small line near the bottom.
+        let ask = |k: &Ask| if *k == Ask::Save { "save session as" } else { "worktree branch" };
+        let note = a.prompt.as_ref().map(|(k, t)| (format!("{}: {t}\u{258f}", ask(k)), 0.9)).or(a.toast.clone().map(|t| (t, 0.6)));
         if let Some((text, alpha)) = note {
             let (cw, ch) = (w as f32 / s, h as f32 / s - CAPTION_H);
             let bw = 380f32.min(cw - 16.0);
@@ -2324,7 +2586,7 @@ unsafe fn draw_chrome(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidCol
                         (_, true) => LABEL_FOCUS_ALPHA,
                         _ => LABEL_ALPHA,
                     };
-                    (p.name(a.home.as_deref()).unwrap_or_default(), alpha)
+                    (p.label(a.home.as_deref()), alpha)
                 }
             };
             let (x, room) = (n as f32 * tw + TAB_PAD, (tw - 2.0 * TAB_PAD).max(0.0));
@@ -2511,12 +2773,7 @@ unsafe fn copy(hwnd: HWND) -> bool {
 
 unsafe fn paste(hwnd: HWND) {
     let Some(text) = clipboard_text(hwnd) else { return };
-    with(|a| {
-        if let Some(p) = a.panes.get_mut(a.focus) {
-            let bracketed = p.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-            p.input(paste_text(&text, bracketed).into_bytes());
-        }
-    });
+    with(|a| a.type_in(|m| Some(paste_text(&text, m.contains(TermMode::BRACKETED_PASTE)).into_bytes())));
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
@@ -2642,6 +2899,7 @@ fn close_all(a: &mut App) {
         let _ = p.tx.send(Msg::Shutdown);
     }
     (a.tree, a.focus, a.view, a.drag, a.select, a.rename, a.prompt) = (None, 0, View::Grid, None, None, None, None);
+    a.broadcast = false;
 }
 
 /// Leave the landing page through choice `i`: back to the running session, a saved session, or a
@@ -2702,7 +2960,7 @@ unsafe fn go_home(hwnd: HWND) {
         let mut l = Landing::new(rows);
         l.sel = 1; // the running session
         a.landing = Some(l);
-        (a.drag, a.select, a.rename, a.prompt) = (None, None, None, None);
+        (a.drag, a.select, a.rename, a.prompt, a.broadcast) = (None, None, None, None, false);
     });
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
@@ -2849,6 +3107,71 @@ unsafe fn settings_key(hwnd: HWND, vk: u16, chord: Chord) {
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
+const SETTINGS_VALUE: f32 = 18.0; // cells from LAND_X to a settings row's value
+const SETTINGS_W: f32 = 46.0; // cells, width of a settings row's bar
+
+/// Top of settings row `i` for rows `lh` DIPs tall: two lines below LAND_Y, with half a line
+/// between the look (theme, opacity) and the shortcuts.
+fn settings_y(i: usize, lh: f32) -> f32 {
+    LAND_Y + 2.0 * lh + i as f32 * lh + if i >= 2 { lh / 2.0 } else { 0.0 }
+}
+
+/// The settings row (of `rows`) under `(x, y)`, for cells `cw` wide and rows `lh` tall.
+fn settings_row((x, y): (f32, f32), cw: f32, lh: f32, rows: usize) -> Option<usize> {
+    let across = (LAND_X - 12.0..LAND_X - 12.0 + SETTINGS_W * cw).contains(&x);
+    (0..rows).find(|&i| across && (settings_y(i, lh)..settings_y(i, lh) + lh).contains(&y))
+}
+
+/// Step the theme (row 0) or the opacity (row 1) by `d`.
+fn settings_step(s: &mut Settings, row: usize, d: isize) {
+    match row {
+        0 => s.theme = cycle(THEMES.len(), s.theme, d),
+        _ => s.opacity = (s.opacity + 0.05 * d as f32).clamp(MIN_OPACITY, 1.0),
+    }
+}
+
+/// The mouse on the settings page: hovering selects a row; a click on the theme or opacity steps
+/// it (back on its ‹, else forward), the wheel steps it too; a click on a shortcut waits for its
+/// new keys, a right-click puts back its default. Elsewhere the wheel moves the selection.
+unsafe fn settings_mouse(hwnd: HWND, msg: u32, wp: WPARAM) {
+    let m = mouse(hwnd);
+    let rows = 2 + ACTIONS.len();
+    let changed = with(|a| {
+        let (cw, lh) = (a.cell.0, land_line(a.cell.1));
+        let Some(page) = a.page.as_mut() else { return false };
+        let s = &mut a.settings;
+        let row = settings_row(m, cw, lh, rows);
+        let up = (wp.0 >> 16) as u16 as i16 > 0;
+        match (msg, row) {
+            (WM_MOUSEMOVE, Some(i)) if !page.capture => page.sel = i,
+            (WM_MOUSEWHEEL, Some(i @ 0..=1)) if !page.capture => {
+                page.sel = i;
+                settings_step(s, i, if up { 1 } else { -1 });
+                return true;
+            }
+            (WM_MOUSEWHEEL, _) if !page.capture => page.sel = cycle(rows, page.sel, if up { -1 } else { 1 }),
+            (WM_LBUTTONDOWN | WM_RBUTTONDOWN, _) if page.capture => page.capture = false,
+            (WM_LBUTTONDOWN, Some(i @ 0..=1)) => {
+                page.sel = i;
+                settings_step(s, i, if m.0 < LAND_X + (SETTINGS_VALUE + 1.5) * cw { -1 } else { 1 });
+                return true;
+            }
+            (WM_LBUTTONDOWN, Some(i)) => (page.sel, page.capture) = (i, true),
+            (WM_RBUTTONDOWN, Some(i)) if i >= 2 => {
+                page.sel = i;
+                s.bind(i - 2, parse_chord(ACTIONS[i - 2].3));
+                return true;
+            }
+            _ => {}
+        }
+        false
+    });
+    if changed {
+        apply_settings(hwnd);
+    }
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
 /// The settings page, in the style of the landing page: a title, then a row per setting with its
 /// value (the selected one bright with a green ❯), the keys, and the shortcuts that can't change.
 unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush) {
@@ -2870,39 +3193,40 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
     for (act, k) in ACTIONS.iter().zip(s.keys) {
         rows.push((act.2.to_string(), k.map_or("none".into(), chord_text)));
     }
-    let top = LAND_Y + 2.0 * lh;
-    let value_x = LAND_X + 18.0 * cw;
+    let value_x = LAND_X + SETTINGS_VALUE * cw;
     for (i, (label, value)) in rows.iter().enumerate() {
-        // A gap between the look and the shortcuts.
-        let y = top + i as f32 * lh + if i >= 2 { lh / 2.0 } else { 0.0 };
+        let y = settings_y(i, lh);
         let on = i == page.sel;
         let value = if on && page.capture { "press the new keys\u{2026}".to_string() } else { value.clone() };
         if on {
             brush.SetColor(&color(fg(), 0.07));
-            let bar = D2D1_ROUNDED_RECT { rect: rect(LAND_X - 12.0, y, 46.0 * cw, lh), radiusX: 6.0, radiusY: 6.0 };
+            let bar = D2D1_ROUNDED_RECT { rect: rect(LAND_X - 12.0, y, SETTINGS_W * cw, lh), radiusX: 6.0, radiusY: 6.0 };
             rt.FillRoundedRectangle(&bar, brush);
             line("\u{276f}", LAND_X, y, t.ansi[2], 1.0);
         }
         line(label, LAND_X + 2.0 * cw, y, t.fg, if on { 1.0 } else { 0.6 });
         line(&value, value_x, y, if on && page.capture { t.ansi[3] } else { t.fg }, if on { 0.9 } else { 0.45 });
     }
-    let y = top + (rows.len() as f32 + 1.5) * lh;
+    let y = settings_y(rows.len(), lh) + lh;
     let keys = if page.capture {
-        "press a key with Ctrl or Alt   Esc cancel"
+        "press a key with Ctrl or Alt   Esc or click cancel"
     } else if page.sel < 2 {
-        "\u{2191}\u{2193} choose   \u{2190}\u{2192} change   Esc back"
+        "\u{2191}\u{2193} choose   \u{2190}\u{2192} change (or click \u{2039} \u{203a}, wheel)   Esc back"
     } else {
-        "\u{2191}\u{2193} choose   Enter new keys   Del default   Esc back"
+        "\u{2191}\u{2193} choose   Enter or click: new keys   Del or right-click: default   Esc back"
     };
     line(keys, LAND_X, y, t.fg, 0.4);
     line("fixed: Alt+arrows focus   Alt+Shift+arrows resize   Ctrl+Alt+arrows swap   Ctrl+Tab next pane", LAND_X, y + lh, t.fg, 0.25);
     line("Shift+arrows select (Ctrl: by word)   Ctrl+C / Ctrl+V copy, paste   Ctrl+Plus / Minus / 0 font", LAND_X, y + 2.0 * lh, t.fg, 0.25);
+    line("Shift+drag selects in apps that take the mouse (vim, tmux, htop)", LAND_X, y + 3.0 * lh, t.fg, 0.25);
 }
 
-/// Enter in the save-session prompt: save under the typed name and say so for a moment.
+/// Enter in the prompt: save under the typed name and say so for a moment, or open the worktree pane.
 unsafe fn end_prompt(hwnd: HWND, keep: bool) {
-    let typed = with(|a| a.prompt.take());
-    if let (true, Some(name)) = (keep, typed.as_deref().and_then(session_file_name)) {
+    let (ask, typed) = with(|a| a.prompt.take()).unzip();
+    if keep && ask == Some(Ask::Worktree) {
+        open_worktree(hwnd, typed.unwrap_or_default().trim());
+    } else if let (true, Some(name)) = (keep, typed.as_deref().and_then(session_file_name)) {
         let file = session_path(&name).filter(|f| save_session(f));
         let saved = file.is_some();
         if file.is_some() {
@@ -2911,6 +3235,87 @@ unsafe fn end_prompt(hwnd: HWND, keep: bool) {
         toast(hwnd, if saved { format!("saved \u{201c}{name}\u{201d}") } else { "could not save".into() });
     }
     let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
+/// Run git with `args` (quoted here; none may hold a `"`), without a console window, and wait
+/// for it. Whether it succeeded. CreateProcessW, not std::process, which adds ~70 KB to the exe.
+unsafe fn git(exe: &str, args: &[&str]) -> bool {
+    let line: String = std::iter::once(exe).chain(args.iter().copied()).map(|a| format!("\"{a}\" ")).collect();
+    let mut line = wide(line.trim_end());
+    let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    let mut pi = PROCESS_INFORMATION::default();
+    if CreateProcessW(None, Some(windows::core::PWSTR(line.as_mut_ptr())), None, None, false, CREATE_NO_WINDOW, None, None, &si, &mut pi).is_err() {
+        return false;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    let mut code = 1;
+    let _ = GetExitCodeProcess(pi.hProcess, &mut code);
+    let _ = (CloseHandle(pi.hProcess), CloseHandle(pi.hThread));
+    code == 0
+}
+
+/// The top folder of the git repo or worktree that holds `dir`: the nearest one with a `.git`.
+fn repo_root(dir: &std::path::Path) -> Option<&std::path::Path> {
+    dir.ancestors().find(|d| d.join(".git").exists())
+}
+
+/// Git for Windows' git.exe beside the bash.exe the panes run.
+fn git_exe(bash: &str) -> String {
+    let git = std::path::Path::new(bash).with_file_name("git.exe");
+    if git.exists() { git.to_string_lossy().into_owned() } else { "git".into() }
+}
+
+/// Whether `name` is fine as a new branch and folder name: letters, digits and `- _ . /`, not
+/// starting with `-`, `.` or `/`, no `..`, not ending with `/` or `.lock`.
+fn branch_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+        && !name.starts_with(['-', '.', '/'])
+        && !name.ends_with('/')
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("//")
+}
+
+/// The folder of the worktree for branch `name` of the repo at `root`: `<repo>-<name>` beside it,
+/// with `/` in the name as `-`.
+fn worktree_dir(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let repo = root.file_name()?.to_string_lossy();
+    Some(root.with_file_name(format!("{repo}-{}", name.replace('/', "-"))))
+}
+
+/// The worktree shortcut: a worktree of the focused pane's repo on branch `name` (a new branch,
+/// or the existing one; an existing folder is reused), opened in a new pane named `name`.
+// ponytail: git runs on the UI thread; a big checkout freezes the window until it is done.
+unsafe fn open_worktree(hwnd: HWND, name: &str) {
+    let (cwd, exe) = with(|a| (a.panes.get(a.focus).and_then(|p| p.names.lock().ok()?.win.clone()), git_exe(&a.bash)));
+    let made = (|| {
+        if !branch_ok(name) {
+            return Err("use letters, digits and - _ . / for the branch".to_string());
+        }
+        let cwd = std::path::PathBuf::from(cwd.ok_or("this pane's folder is not known yet")?);
+        let root = repo_root(&cwd).ok_or("not inside a git repo")?;
+        let dir = worktree_dir(root, name).ok_or("no folder beside this repo")?;
+        if !dir.is_dir() {
+            let (r, d) = (root.to_string_lossy(), dir.to_string_lossy());
+            // A new branch, else the branch that already exists.
+            let added = git(&exe, &["-C", &r, "worktree", "add", &d, "-b", name]) || git(&exe, &["-C", &r, "worktree", "add", &d, name]);
+            if !added || !dir.is_dir() {
+                return Err(format!("git worktree add {name} failed"));
+            }
+        }
+        Ok(dir)
+    })();
+    match made {
+        Ok(dir) => {
+            leave_zoom(hwnd);
+            if add_pane_in(hwnd, None, dir.to_str()) {
+                with(|a| a.panes.last_mut().map(|p| p.custom = Some(name.into())));
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+        Err(e) => toast(hwnd, e.chars().take(60).collect()),
+    }
 }
 
 /// The zoom and grid / tabs shortcuts, or the view button: switch to `to` or back to the grid (see `toggled`).
@@ -2999,7 +3404,7 @@ unsafe fn run(hwnd: HWND, act: Action) {
                 toast(hwnd, if saved { format!("saved \u{201c}{}\u{201d}", stem(&file)) } else { "could not save".into() });
             }
             None => {
-                with(|a| (a.prompt, a.toast) = (Some(String::new()), None));
+                with(|a| (a.prompt, a.toast) = (Some((Ask::Save, String::new())), None));
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
         },
@@ -3008,6 +3413,14 @@ unsafe fn run(hwnd: HWND, act: Action) {
         Action::Home => go_home(hwnd),
         Action::Settings => {
             with(|a| a.page = Some(SettingsPage { sel: 0, capture: false }));
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        Action::Broadcast => {
+            with(|a| a.broadcast = !a.broadcast);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+        Action::Worktree => {
+            with(|a| (a.prompt, a.toast) = (Some((Ask::Worktree, String::new())), None));
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
@@ -3061,7 +3474,7 @@ unsafe fn on_key(hwnd: HWND, vk: u16, scan: u32) -> bool {
                 }
                 0x08 => {
                     with(|a| {
-                        if let Some(t) = a.prompt.as_mut() {
+                        if let Some((_, t)) = a.prompt.as_mut() {
                             t.pop();
                         }
                     });
@@ -3203,6 +3616,12 @@ unsafe fn on_key(hwnd: HWND, vk: u16, scan: u32) -> bool {
         with(|a| a.skip_char = true);
         return true;
     }
+    // Esc ends broadcasting, and then reaches no pane.
+    if vk == 0x1B && !alt && with(|a| std::mem::take(&mut a.broadcast)) {
+        with(|a| a.skip_char = true);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        return true;
+    }
     // Esc drops a selection instead of reaching the shell.
     if vk == 0x1B
         && with(|a| {
@@ -3215,12 +3634,11 @@ unsafe fn on_key(hwnd: HWND, vk: u16, scan: u32) -> bool {
         return true;
     }
     let sent = with(|a| {
-        let Some(p) = a.panes.get_mut(a.focus) else { return false };
-        let app_cursor = p.term.lock().mode().contains(TermMode::APP_CURSOR);
-        let Some(seq) = key_seq(vk, shift, alt, ctrl, app_cursor) else { return false };
-        p.input(seq.into_bytes());
-        a.skip_char = vk == 0x09; // shift+tab also arrives as a '\t' WM_CHAR
-        true
+        let sent = a.type_in(|m| key_seq(vk, shift, alt, ctrl, m.contains(TermMode::APP_CURSOR)).map(String::into_bytes));
+        if sent {
+            a.skip_char = vk == 0x09; // shift+tab also arrives as a '\t' WM_CHAR
+        }
+        sent
     });
     if sent {
         let _ = InvalidateRect(Some(hwnd), None, false); // the selection is gone
@@ -3247,7 +3665,7 @@ unsafe fn on_char(unit: u16, alt: bool) {
             }
             return;
         }
-        if let Some(typed) = a.prompt.as_mut() {
+        if let Some((_, typed)) = a.prompt.as_mut() {
             if !alt && !s.chars().any(char::is_control) && typed.chars().count() < PROMPT_MAX {
                 typed.push_str(&s);
             }
@@ -3269,9 +3687,7 @@ unsafe fn on_char(unit: u16, alt: bool) {
         if alt {
             s.insert(0, '\x1b');
         }
-        if let Some(p) = a.panes.get_mut(a.focus) {
-            p.input(s.into_bytes());
-        }
+        a.type_in(|_| Some(s.clone().into_bytes()));
     });
 }
 
@@ -3309,6 +3725,64 @@ unsafe fn wheel(hwnd: HWND, m: (f32, f32), delta: i32) {
     let _ = InvalidateRect(Some(hwnd), None, false);
 }
 
+/// The mouse for apps that ask for it. A press (`Some(true)`) over such a pane, without Shift,
+/// focuses it and is reported, and so are the drags and the release of that button (`Some(false)`)
+/// until it goes up; `None` is a move. True when the event was the app's.
+// ponytail: moves with no button held (mode 1003 hover) are not reported.
+unsafe fn report_mouse(hwnd: HWND, button: u8, press: Option<bool>) -> bool {
+    let (shift, alt, ctrl) = modifiers();
+    let (m, mods) = (mouse(hwnd), 8 * alt as u8 + 16 * ctrl as u8);
+    // The pane, the terminal mode, the grid point and the cell to report under the mouse in pane `i`.
+    let at = |a: &App, i: usize| {
+        let p = &a.panes[i];
+        let term = p.term.lock();
+        let (point, _) = p.point_at(&term, m, a.cell);
+        let cell = (point.column.0, (point.line.0 + term.grid().display_offset() as i32) as usize);
+        (*term.mode(), point, cell)
+    };
+    let mine = with(|a| {
+        let held = a.report.and_then(|(id, b, last)| Some((a.panes.iter().position(|p| p.id == id)?, b, last)));
+        match (press, held) {
+            // A second button while one is held stays with the app, unreported.
+            (Some(true), Some(_)) => true,
+            (Some(true), None) if !shift => {
+                let Some(i) = pane_at(a, m) else { return false };
+                let (mode, point, cell) = at(a, i);
+                let Some(bytes) = mouse_report(mode, button, true, false, mods, cell) else { return false };
+                a.panes[i].send(bytes);
+                (a.focus, a.report) = (i, Some((a.panes[i].id, button, point)));
+                true
+            }
+            (None, Some((i, b, last))) => {
+                let (mode, point, cell) = at(a, i);
+                if point != last {
+                    a.report = Some((a.panes[i].id, b, point));
+                    mouse_report(mode, b, true, true, mods, cell).map(|bytes| a.panes[i].send(bytes));
+                }
+                true
+            }
+            (Some(false), Some((i, b, _))) if b == button => {
+                let (mode, _, cell) = at(a, i);
+                mouse_report(mode, b, false, false, mods, cell).map(|bytes| a.panes[i].send(bytes));
+                a.report = None;
+                true
+            }
+            (Some(false), Some(_)) => true,
+            _ => false,
+        }
+    });
+    match press {
+        Some(true) if mine => {
+            SetCapture(hwnd);
+        }
+        Some(false) if mine && with(|a| a.report.is_none()) => {
+            let _ = ReleaseCapture();
+        }
+        _ => {}
+    }
+    mine
+}
+
 /// Refreshes the pane statuses and runs the timer only while one is busy.
 unsafe fn sync_status(hwnd: HWND) {
     let (changed, busy) = with(|a| (a.refresh_status(), a.panes.iter().any(|p| p.status == Status::Busy)));
@@ -3317,6 +3791,23 @@ unsafe fn sync_status(hwnd: HWND) {
     } else {
         let _ = KillTimer(Some(hwnd), STATUS_TIMER);
     }
+    if changed {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+/// Tags each pane with the coding agent running under its shell, if any.
+unsafe fn sync_agents(hwnd: HWND) {
+    if with(|a| a.panes.is_empty()) {
+        return;
+    }
+    let procs = processes();
+    let changed = with(|a| {
+        a.panes.iter_mut().fold(false, |c, p| {
+            let now = p.pid.and_then(|pid| agent(&procs, pid)).map(|x| x.1);
+            (std::mem::replace(&mut p.agent, now) != now) | c
+        })
+    });
     if changed {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
@@ -3414,6 +3905,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let hit = frame_hit((pt.x, pt.y), (w as i32, h as i32), border, (CAPTION_H * s) as i32, buttons);
             return LRESULT(hit as isize);
         }
+        // A button held down for an app gets its drags and release wherever the mouse goes, the caption too.
+        WM_MOUSEMOVE | WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP if with(|a| a.report.is_some()) => {
+            let button = match msg {
+                WM_RBUTTONUP => 2,
+                WM_MBUTTONUP => 1,
+                _ => 0,
+            };
+            report_mouse(hwnd, button, (msg != WM_MOUSEMOVE).then_some(false));
+            return LRESULT(0);
+        }
         WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP if caption_mouse(hwnd, msg) => return LRESULT(0),
         WM_ENTERSIZEMOVE if ACCENT.load(Ordering::Relaxed) => {
             MOVING.store(true, Ordering::Relaxed);
@@ -3432,14 +3933,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             sync_status(hwnd);
             return LRESULT(0);
         }
+        WM_TIMER if wp.0 == AGENT_TIMER => {
+            sync_agents(hwnd);
+            return LRESULT(0);
+        }
         WM_TIMER if wp.0 == TOAST_TIMER => {
             let _ = KillTimer(Some(hwnd), TOAST_TIMER);
             with(|a| a.toast = None);
             let _ = InvalidateRect(Some(hwnd), None, false);
             return LRESULT(0);
         }
-        // The settings page takes no mouse input, and none reaches the panes behind it.
-        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MOUSEWHEEL if with(|a| a.page.is_some()) => return LRESULT(0),
+        // The settings page takes the mouse, and none of it reaches the panes behind it.
+        WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_MOUSEWHEEL if with(|a| a.page.is_some()) => {
+            settings_mouse(hwnd, msg, wp);
+            return LRESULT(0);
+        }
         // The landing page: hovering selects a choice, a click opens it.
         WM_MOUSEMOVE | WM_LBUTTONDOWN if with(|a| a.landing.is_some()) => {
             let m = mouse(hwnd);
@@ -3529,6 +4037,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             } else if let Some((path, _)) = divider_at(hwnd) {
                 with(|a| a.drag = Some(path));
                 SetCapture(hwnd);
+            } else if report_mouse(hwnd, 0, Some(true)) {
+                // The app asked for the mouse; Shift+click still selects (below).
+                with(|a| a.panes.iter_mut().for_each(Pane::clear_selection));
+                let _ = InvalidateRect(Some(hwnd), None, false);
             } else {
                 // Click inside a pane: it gets the keyboard and a new selection (word on a double
                 // click, line on a triple click) that follows the mouse until the button is released.
@@ -3612,6 +4124,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             let _ = ReleaseCapture();
         }
+        WM_MBUTTONDOWN => {
+            report_mouse(hwnd, 1, Some(true));
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            return LRESULT(0);
+        }
+        WM_RBUTTONDOWN if report_mouse(hwnd, 2, Some(true)) => {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            return LRESULT(0);
+        }
         WM_RBUTTONDOWN => {
             // Right-click copies a selection, or pastes when there is none.
             let m = mouse(hwnd);
@@ -3636,6 +4157,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             a.cap_down = None;
             a.drag = None;
             a.select = None;
+            a.report = None;
         }),
         WM_DESTROY => PostQuitMessage(0),
         _ => {}
@@ -3707,7 +4229,7 @@ fn main() {
                 select: None, click: (0, f32::MIN, f32::MIN, 0),
                 home: std::env::var("USERPROFILE").ok(), rename: None, title: "dterm".into(),
                 view: View::Grid, mouse: None, tracking: false, landing: None, prompt: None, toast: None,
-                created: now(), file: None, settings, page: None, seen: true,
+                created: now(), file: None, settings, page: None, seen: true, broadcast: false, report: None,
             })
         });
         let hwnd = CreateWindowExW(
@@ -3743,6 +4265,7 @@ fn main() {
                 return fail("Could not start Git Bash");
             }
         }
+        SetTimer(Some(hwnd), AGENT_TIMER, AGENT_TICK, None);
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT); // honors a shortcut's "Run: Maximized"
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -3773,16 +4296,42 @@ fn check() {
     assert_eq!(paste_text("x\x1b[201~y", true), "\x1b[200~x[201~y\x1b[201~");
     // Pane status: busy while output is fresh, done once it stops, waiting after a bell; focus clears it.
     use Status::*;
-    assert_eq!(next_status(Idle, false, false, Some(100)), Busy);
-    assert_eq!(next_status(Busy, false, false, Some(BUSY_MS)), Done);
-    assert_eq!(next_status(Done, false, false, Some(BUSY_MS + 1)), Done);
-    assert_eq!(next_status(Done, false, false, Some(10)), Busy);
-    assert_eq!(next_status(Idle, false, false, None), Idle);
-    assert_eq!(next_status(Idle, false, false, Some(BUSY_MS + 1)), Idle); // old output is not news
-    assert_eq!(next_status(Busy, false, true, Some(10)), Attention);
-    assert_eq!(next_status(Attention, false, false, Some(10)), Attention); // sticks through output
-    assert_eq!(next_status(Attention, true, false, Some(10)), Idle);
-    assert_eq!(next_status(Done, true, true, None), Idle);
+    assert_eq!(next_status(Idle, false, false, false, Some(100)), Busy);
+    assert_eq!(next_status(Busy, false, false, false, Some(BUSY_MS)), Done);
+    assert_eq!(next_status(Done, false, false, false, Some(BUSY_MS + 1)), Done);
+    assert_eq!(next_status(Done, false, false, false, Some(10)), Busy);
+    assert_eq!(next_status(Idle, false, false, false, None), Idle);
+    assert_eq!(next_status(Idle, false, false, false, Some(BUSY_MS + 1)), Idle); // old output is not news
+    assert_eq!(next_status(Busy, false, true, false, Some(10)), Attention);
+    assert_eq!(next_status(Attention, false, false, false, Some(10)), Attention); // sticks through output
+    assert_eq!(next_status(Attention, true, false, false, Some(10)), Idle);
+    assert_eq!(next_status(Done, true, true, true, None), Idle);
+    assert_eq!(next_status(Busy, false, false, true, Some(10)), Done); // OSC 133: done at once, prompt output or not
+    assert_eq!(next_status(Busy, false, true, true, Some(10)), Attention);
+    // OSC signals: notifications, ConEmu's numbered OSC 9 commands are not, shell integration marks.
+    assert_eq!(osc_signal(b"9;Claude needs your permission"), Some(Signal::Notify));
+    assert_eq!((osc_signal(b"9;4;1;50"), osc_signal(b"9;9;C:\\x"), osc_signal(b"9"), osc_signal(b"9;")), (None, None, None, None));
+    assert_eq!((osc_signal(b"777;notify;Claude;done"), osc_signal(b"777;other")), (Some(Signal::Notify), None));
+    assert_eq!((osc_signal(b"133;A"), osc_signal(b"133;B"), osc_signal(b"133;C"), osc_signal(b"133;D;0")), (Some(Signal::Prompt), None, Some(Signal::Running), Some(Signal::Finished)));
+    assert_eq!((osc_signal(b"0;title"), osc_signal(b"")), (None, None));
+    let scan = |chunks: &[&[u8]]| {
+        let (mut s, mut out) = (OscScan::default(), Vec::new());
+        chunks.iter().for_each(|c| s.feed(c, |x| out.push(x)));
+        out
+    };
+    assert_eq!(scan(&[b"hi\x1b]9;wait\x07", b"\x1b]133;C\x1b\\"]), [Signal::Notify, Signal::Running]);
+    assert_eq!(scan(&[b"\x1b]13", b"3;D\x1b", b"\\x"]), [Signal::Finished]); // split across reads
+    assert_eq!(scan(&[b"\x1b]9;a\x18\x07\x1b[31m\x1b]133;A\x1b]133;C\x07"]), [Signal::Running]); // CAN aborts; ESC ] restarts
+    let (act, mut ran) = (Activity::default(), false);
+    act.signal(Signal::Finished, &mut ran); // a prompt with no command before it
+    assert!(!act.done.load(Ordering::Relaxed));
+    act.signal(Signal::Running, &mut ran);
+    act.signal(Signal::Prompt, &mut ran);
+    assert!(act.done.load(Ordering::Relaxed) && !ran);
+    act.signal(Signal::Running, &mut ran);
+    assert!(!act.done.load(Ordering::Relaxed));
+    act.signal(Signal::Notify, &mut ran);
+    assert!(act.bell.load(Ordering::Relaxed));
     // Text area: PAD all round, or a taller top margin where the name label sits.
     let pane = (10.0, 20.0, 1000.0, 600.0);
     assert_eq!(inner(pane, false), ((18.0, 28.0), (984.0, 584.0)));
@@ -3953,6 +4502,25 @@ fn check() {
     assert_eq!(wheel_input(TermMode::ALT_SCREEN, 120, (0, 0)), None);
     assert_eq!(wheel_input(TermMode::ALTERNATE_SCROLL, 120, (0, 0)), None);
     assert_eq!(wheel_input(TermMode::NONE, 120, (0, 0)), None);
+    // Mouse buttons for apps: SGR press / release, drags only in 1002 / 1003, legacy release is button 3.
+    let click = TermMode::MOUSE_REPORT_CLICK;
+    assert_eq!(mouse_report(sgr, 0, true, false, 0, (4, 9)).as_deref(), Some(&b"\x1b[<0;5;10M"[..]));
+    assert_eq!(mouse_report(sgr, 2, false, false, 16, (0, 0)).as_deref(), Some(&b"\x1b[<18;1;1m"[..]));
+    assert_eq!(mouse_report(sgr, 0, true, true, 0, (1, 1)), None); // 1000 asks for no drags
+    assert_eq!(mouse_report(TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE, 0, true, true, 8, (1, 1)).as_deref(), Some(&b"\x1b[<40;2;2M"[..]));
+    assert_eq!(mouse_report(click, 1, true, false, 0, (0, 0)).as_deref(), Some(&[0x1b, b'[', b'M', 33, 33, 33][..]));
+    assert_eq!(mouse_report(click, 1, false, false, 0, (300, 0)).as_deref(), Some(&[0x1b, b'[', b'M', 35, 255, 33][..]));
+    assert_eq!(mouse_report(TermMode::NONE, 0, true, false, 0, (0, 0)), None);
+    // Settings rows under the mouse: half a line between the look and the shortcuts, only across the bars.
+    let (cw, lh) = (10.0, 30.0);
+    let row = |y: f32| settings_row((LAND_X, y), cw, lh, 14);
+    assert_eq!((row(settings_y(0, lh) + 1.0), row(settings_y(1, lh) + 29.0), row(settings_y(2, lh) + 1.0)), (Some(0), Some(1), Some(2)));
+    assert_eq!((row(settings_y(2, lh) - 1.0), row(settings_y(0, lh) - 1.0), row(settings_y(14, lh) + 1.0)), (None, None, None));
+    assert_eq!(settings_row((LAND_X + SETTINGS_W * cw, settings_y(0, lh) + 1.0), cw, lh, 14), None);
+    let mut st = Settings::default();
+    settings_step(&mut st, 0, -1);
+    settings_step(&mut st, 1, 1);
+    assert_eq!((st.theme, st.opacity), (THEMES.len() - 1, OPACITY + 0.05));
     assert_eq!(clip_units("a\nb"), [97, 13, 10, 98, 0]);
     // Sessions: pane 0 | (pane 1 over pane 2), round trip through the file format.
     let tree = Node::Split {
@@ -4050,7 +4618,14 @@ fn check() {
     assert_eq!(pane_count(1), "1 pane");
     // Only commands dterm saves itself are run from a session file.
     assert!(resume_command("claude") && resume_command("claude --resume 3f2a-9c"));
+    assert!(resume_command("codex") && resume_command("opencode") && resume_command("aider --restore-chat-history"));
     assert!(!resume_command("claude --resume ") && !resume_command("claude --resume x; rm -rf ~") && !resume_command("vim"));
+    assert!(!resume_command("aider") && !resume_command("codex; rm -rf ~") && !resume_command("opencode --x"));
+    // Agents by exe name, also native builds named after their target; nothing that merely starts alike.
+    assert_eq!((agent_of("claude.exe"), agent_of("Codex.EXE"), agent_of("codex-x86_64-pc-windows-msvc.exe")), (Some("claude"), Some("codex"), Some("codex")));
+    assert_eq!((agent_of("opencode.exe"), agent_of("aider.exe")), (Some("opencode"), Some("aider")));
+    assert_eq!((agent_of("claudex.exe"), agent_of("claude"), agent_of("node.exe")), (None, None, None));
+    assert_eq!((tagged(Some("codex"), Some("api".into())), tagged(Some("aider"), None), tagged(None, Some("x".into()))), ("[codex] api".into(), "[aider]".into(), "x".into()));
     // Shortcuts: names, parsing, the keypad's + and -, and Ctrl or Alt required.
     let ca = |vk| Chord { vk, ctrl: true, alt: true, shift: false };
     assert_eq!(parse_chord("Ctrl+Alt+T"), Some(ca(0x54)));
@@ -4062,8 +4637,31 @@ fn check() {
     for a in ACTIONS {
         assert_eq!(parse_chord(a.3).map(chord_text).as_deref(), Some(a.3)); // every default reads back
     }
+    // Worktree branches: safe names only; the folder sits beside the repo.
+    assert!(branch_ok("feat-x") && branch_ok("fix/login_2") && branch_ok("v1.2"));
+    for bad in ["", "-x", ".x", "/x", "x/", "a..b", "a//b", "x.lock", "a b", "a;rm", "a\\b", "\u{e9}"] {
+        assert!(!branch_ok(bad), "{bad:?}");
+    }
+    assert_eq!(worktree_dir(std::path::Path::new("C:/code/dterm"), "fix/login"), Some(std::path::PathBuf::from("C:/code/dterm-fix-login")));
+    assert_eq!(worktree_dir(std::path::Path::new("C:/"), "x"), None);
+    let here = std::env::current_dir().unwrap();
+    assert_eq!(repo_root(&here.join("src")), Some(here.as_path())); // this checkout
+    // Real git: a worktree of a scratch repo, made once, then the existing branch is accepted again.
+    let exe = unsafe { git_exe(&git_bash()) };
+    let scratch = std::env::temp_dir().join(format!("dterm-git-{}", std::process::id()));
+    let repo = scratch.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let r = repo.to_string_lossy().into_owned();
+    let g = |args: &[&str]| unsafe { git(&exe, args) };
+    assert!(g(&["-C", &r, "init", "-q"]) && g(&["-C", &r, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]));
+    let wt = worktree_dir(&repo, "feat/a").unwrap();
+    assert!(g(&["-C", &r, "worktree", "add", &wt.to_string_lossy(), "-b", "feat/a"]) && wt.join(".git").is_file());
+    assert!(!g(&["-C", &r, "worktree", "add", &scratch.join("other").to_string_lossy(), "-b", "feat/a"])); // branch exists: -b fails
+    assert!(!g(&["-C", &r, "no-such-command"]));
+    let _ = std::fs::remove_dir_all(&scratch);
     // Settings: defaults, binding moves keys, the file round trip, bad lines keep defaults.
     let mut st = Settings::default();
+    assert_eq!((st.action(ca(0x42)), st.action(ca(0x4E))), (Some(Action::Broadcast), Some(Action::Worktree)));
     assert_eq!(st.action(ca(0x54)), Some(Action::NewPane));
     assert_eq!(st.action(ca(0xBD)), Some(Action::SplitDown));
     assert_eq!(st.action(Chord { vk: 0x54, ctrl: true, alt: false, shift: true }), None); // Ctrl+Shift+T is the shell's now
@@ -4082,8 +4680,14 @@ fn check() {
     assert_eq!((word_move(6, false, 6, words), word_move(4, false, 6, words), word_move(1, false, 6, words)), (4, 0, 0));
     // Processes: Claude Code under Git Bash's launcher and its bash; loops from reused pids end.
     let procs = [(10, 1, "bash.exe".into()), (11, 10, "bash.exe".into()), (12, 11, "claude.exe".into()), (20, 1, "Claude.exe".into())];
-    assert_eq!((descendant(&procs, 10, "claude.exe"), descendant(&procs, 11, "CLAUDE.EXE"), descendant(&procs, 12, "claude.exe")), (Some(12), Some(12), None));
-    assert_eq!(descendant(&[(5, 6, "a".into()), (6, 5, "b".into())], 5, "c"), None);
+    let is = |n: &'static str| move |e: &str| e.eq_ignore_ascii_case(n);
+    assert_eq!((descendant(&procs, 10, is("claude.exe")), descendant(&procs, 11, is("CLAUDE.EXE")), descendant(&procs, 12, is("claude.exe"))), (Some(12), Some(12), None));
+    assert_eq!(descendant(&[(5, 6, "a".into()), (6, 5, "b".into())], 5, is("c")), None);
+    assert_eq!((agent(&procs, 10), agent(&procs, 12)), (Some((12, "claude")), None));
+    let node = [(30, 1, "bash.exe".into()), (31, 30, "node.exe".into()), (32, 31, "codex-x86_64-pc-windows-msvc.exe".into())];
+    assert_eq!(agent(&node, 30), Some((32, "codex"))); // the npm launcher runs the native build
+    assert_eq!(agent_run(&node, 30, "", &mut Vec::new()).as_deref(), Some("codex"));
+    assert_eq!(agent_run(&[(40, 1, "bash.exe".into()), (41, 40, "aider.exe".into())], 40, "", &mut Vec::new()).as_deref(), Some("aider --restore-chat-history"));
     let dir = claude_project("N:\\Davide Chincoli\\12_CODING\\dterm").unwrap();
     assert_eq!(dir.file_name().unwrap(), "N--Davide-Chincoli-12-CODING-dterm");
     // Own frame on Windows 10: edges resize, the caption drags except over its buttons.

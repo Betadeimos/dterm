@@ -30,9 +30,12 @@ Everything is in `src/main.rs` (about 4000 lines) on purpose, for now. Rough map
 | `View`, tab and caption helpers | Grid vs Tabs, tab strip, the title bar dterm draws itself |
 | `Action`, `ACTIONS`, `Chord`, `Settings` | Rebindable shortcuts, settings file parse/write |
 | `Session`, `SavedPane`, `Landing` | Session files, the start page model |
-| `Names`, `Status`, `Activity` | Pane names from OSC titles, busy/done/bell status |
+| `Names`, `Status`, `Activity` | Pane names from OSC titles, busy/done/waiting status |
+| `Signal`, `OscScan`, `Tapped` | OSC 9 / 777 / 133 read from the raw PTY output, feeding `Activity` |
 | `Proxy`, `Pane`, `spawn` | One shell: PTY, terminal state, event bridge |
-| `descendant`, `claude_run` | Finds `claude.exe` under a pane's shell to save and resume conversations |
+| `descendant`, `agent`, `agent_run` | Finds claude, codex, opencode or aider under a pane's shell, to tag the pane and resume the agent |
+| `git`, `open_worktree` | The worktree pane shortcut |
+| `mouse_report`, `report_mouse` | Mouse buttons for apps that ask for them |
 | `App`, `with` | The single global app state (thread-local) |
 | `layout`, `add_pane`, `remove_pane` | Fit panes to the window, resize their PTYs |
 | `paint`, `draw_*` | Direct2D rendering |
@@ -49,7 +52,9 @@ to `wndproc`: it would borrow twice.
 `EventLoop` thread reads the shell's output and updates a `Term` behind a `FairMutex`. Each pane's `Proxy` receives
 terminal events (wakeup, bell, title, exit, replies to the app) and turns them into `PostMessageW` calls to the UI
 thread (`WM_WAKE`, `WM_EXIT`) or writes back to the PTY. Status flags (`Activity`) are shared atomics, so the PTY
-thread never touches `App`.
+thread never touches `App`. The terminal parser ignores OSC 9, 777 and 133, so the PTY is wrapped in `Tapped`, whose
+reader passes every byte through `OscScan` before the parser sees it (that wrapper is why `polling`, already a
+dependency of `alacritty_terminal`, is named in `Cargo.toml`).
 
 **Rendering.** `paint` draws everything with Direct2D, text with DirectWrite, into an `ID2D1HwndRenderTarget`:
 landing page, settings page, or the panes. `draw_term` locks a pane's `Term`, walks its visible cells, and draws
@@ -61,9 +66,10 @@ policy on Windows 10), and dterm paints the translucent tint itself.
 columns and lines and sends `Msg::Resize` to its PTY. Drag-resizing edits split ratios in the tree.
 
 **Sessions.** `save_last` / `write_session` serialize the tree, folders, names and view to small text files under
-`%APPDATA%\dterm`. For Claude Code, `claude_run` walks the process list under each pane's shell, matches the newest
-conversation in `~\.claude\projects\<folder>`, and saves `claude --resume <id>`. Only two command shapes are ever
-typed back in (`resume_command` checks).
+`%APPDATA%\dterm`. `agent_run` walks the process list under each pane's shell for a coding agent. For Claude Code it
+matches the newest conversation in `~\.claude\projects\<folder>` and saves `claude --resume <id>`; aider gets
+`aider --restore-chat-history`, codex and opencode their bare name. Only those exact command shapes are ever typed
+back in (`resume_command` checks).
 
 ## Making a change
 

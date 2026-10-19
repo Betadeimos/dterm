@@ -4,15 +4,38 @@ Goal: be a better daily terminal than Windows Terminal for people who run severa
 (and coding agents like Claude Code) side by side. Small native exe, zero config, looks like
 Windows Terminal, but built around the grid.
 
-## Next: Native Agent Orchestration (<500 KB)
+## Next
 
-- [ ] **One-key git worktree pane:** spawn a new pane in a fresh git worktree branch and launch
-  an agent in it, with one shortcut.
-- [ ] **Multi-agent auto-resume (claude, codex, opencode, aider):** extend the process-tree
-  inspection that restores Claude Code today so it restores and tracks all major CLI coding agents.
-- [ ] **Broadcast input / prompt bar:** send a prompt or shell command to several panes at once.
-- [ ] **OSC 9/777 and OSC 133 agent hooks:** exact prompt-wait and task-completion signals per
-  pane, feeding the status dot.
+- [ ] Launch an agent in the new worktree pane right away (pick which one).
+- [ ] Broadcast to a chosen set of panes, not only all of them.
+- [ ] Report mouse moves with no button held (mode 1003 hover).
+- [ ] Run `git worktree add` off the UI thread, so a big checkout doesn't freeze the window.
+- [ ] A GitHub Actions workflow that builds the release on tag push; font family and size in settings.
+
+## The Native Agent Orchestrator Release (done in v0.3.0)
+
+- [x] **OSC 9/777 and OSC 133 agent signals:** dterm reads the raw PTY output before the terminal
+  parser (which drops these sequences). An OSC 9 or 777 notification turns a background pane's dot
+  yellow at once; an OSC 133 prompt (A) or finished mark (D) after a command (C) turns it green at
+  once, even while the prompt is still being drawn. ConEmu's numbered OSC 9 commands (progress,
+  folder) are not notifications. The 4.5 s quiet timer and the bell stay as the fallback.
+- [x] **Multi-agent detection and auto-resume:** the process tree under each shell is checked every
+  2 s for `claude`, `codex` (also its native `codex-<target>.exe`), `opencode` and `aider`. A pane
+  running one shows `[claude]`, `[codex]`, ... before its name. Saving stores `claude --resume <id>`
+  (or `claude`), `codex`, `opencode` or `aider --restore-chat-history`; only these exact shapes are
+  ever typed back from a session file.
+- [x] **Broadcast input:** Ctrl+Alt+B (rebindable) sends keys and pastes to every pane, each in its
+  own terminal mode (cursor keys, bracketed paste). A red frame on every pane and a note in the
+  title bar show it; Esc or Ctrl+Alt+B stops it, and leaving the session turns it off.
+- [x] **One-key git worktree pane:** Ctrl+Alt+N (rebindable) asks for a branch at the bottom, like
+  saving a session. In the focused pane's repo it runs `git worktree add ../<repo>-<branch> -b
+  <branch>` (or without `-b` when the branch exists, or reuses the folder), with Git for Windows'
+  `git.exe` and no console window, then opens a pane named after the branch in it.
+- [x] **Settings page mouse:** hover selects, a click steps the theme or opacity (back on ‹) or
+  waits for a shortcut's new keys, the wheel steps or moves, right-click resets a shortcut.
+- [x] **Mouse reporting to apps:** apps that ask for the mouse (1000 / 1002 / 1003, SGR 1006 or the
+  legacy encoding) get left, middle and right presses, drags and releases, with Alt and Ctrl.
+  Shift+drag still selects text for dterm.
 
 ## Feedback round 5 (done in v0.2.2)
 
@@ -23,7 +46,7 @@ Windows Terminal, but built around the grid.
   as a background pane; its status stays after you come back until you click or type.
 - [x] **Fixed window title:** `dterm — <session name>`, or `dterm — untitled`; it no longer
   follows the focused pane.
-- [ ] More status signals: OSC 9/777 notifications and OSC 133 prompt marks.
+- [x] More status signals: OSC 9/777 notifications and OSC 133 prompt marks (v0.3.0).
 
 ## Feedback round 4 (done in v0.2.1)
 
@@ -63,8 +86,8 @@ Windows Terminal, but built around the grid.
   used move over). Saved to `%APPDATA%\dterm\settings`.
 - [x] **Versions and releases:** shown on the landing page. `release.ps1` builds
   `dist\dterm-vX.Y.Z.exe` and `.zip`; `-Publish` tags and runs `gh release create`.
-- [ ] Later: a GitHub Actions workflow that builds the release on tag push; mouse support on the
-  settings page (the landing page and tabs already take the mouse); font family and size in settings.
+- [x] Mouse support on the settings page (v0.3.0). Still open: a release workflow on tag push;
+  font family and size in settings.
 
 ## Requested features
 
@@ -78,7 +101,7 @@ Ordered roughly by how much they hurt today.
 - [x] **Ctrl+C copies** when there is a selection, otherwise sends interrupt as today.
 - [x] **Mouse-wheel scrollback** through history. The wheel goes to apps that enable mouse reporting
       or alternate scroll; clicks and drags are not reported to apps yet.
-- [ ] Report clicks / drags to apps that ask for the mouse (vim, tmux, htop).
+- [x] Report clicks / drags to apps that ask for the mouse (vim, tmux, htop); Shift+drag selects (v0.3.0).
 
 ### Layout and shortcuts
 Windows Terminal defaults in brackets, so muscle memory carries over.
@@ -145,8 +168,8 @@ WT does **not** have:
    a calm "done" tint when it finishes, a stronger cue when it rings the bell or asks for input.
    Signals: output activity, the bell, OSC 9/777 notifications, OSC 133 prompt marks.
 3. **Sessions that come back** with names and folders, from a quick landing page.
-4. **Broadcast input:** type once into all panes (or a chosen set).
-5. **Stays tiny:** one native exe (~490 KB today), instant start, no Electron, no settings file needed.
+4. **Broadcast input:** type once into all panes (done; a chosen set is next).
+5. **Stays tiny:** one native exe (~500 KB today), instant start, no Electron, no settings file needed.
 
 ## Other open-source grid terminals
 
