@@ -3208,24 +3208,26 @@ const SETTINGS_VALUE: f32 = 18.0; // cells from LAND_X to a settings row's value
 const SETTINGS_W: f32 = 46.0; // cells, width of a settings row's bar
 const LOOK_ROWS: usize = 3; // theme, opacity, shell; the shortcuts follow
 
-/// Top of settings row `i` for rows `lh` DIPs tall: two lines below LAND_Y, with half a line
-/// between the look (theme, opacity, shell) and the shortcuts.
-fn settings_y(i: usize, lh: f32) -> f32 {
-    LAND_Y + 2.0 * lh + i as f32 * lh + if i >= LOOK_ROWS { lh / 2.0 } else { 0.0 }
-}
-
-const SETTINGS_SPLIT: usize = LOOK_ROWS + 5; // first row of the right column, when there is one
 const SETTINGS_GAP: f32 = 4.0; // cells between the two columns
 
-/// Where settings row `i` starts (its text; the bar begins 12 DIPs to the left) on a page `w`
-/// DIPs wide: one column, or with room for two, the rows from SETTINGS_SPLIT on fill a right
-/// column from the top.
-fn settings_at(i: usize, cw: f32, lh: f32, w: f32) -> (f32, f32) {
-    let two = w >= 2.0 * LAND_X + (2.0 * SETTINGS_W + SETTINGS_GAP) * cw;
-    match i.checked_sub(SETTINGS_SPLIT) {
-        Some(j) if two => (LAND_X + (SETTINGS_W + SETTINGS_GAP) * cw, LAND_Y + 2.0 * lh + j as f32 * lh),
-        _ => (LAND_X, settings_y(i, lh)),
+/// Where the "general" and "shortcuts" headings go on a page `w` DIPs wide, for cells `cw` wide
+/// and rows `lh` tall: side by side two lines below LAND_Y when there is room, else the
+/// shortcuts half a line below the general rows.
+fn settings_heads(cw: f32, lh: f32, w: f32) -> [(f32, f32); 2] {
+    let top = LAND_Y + 2.0 * lh;
+    if w >= 2.0 * LAND_X + (2.0 * SETTINGS_W + SETTINGS_GAP) * cw {
+        [(LAND_X, top), (LAND_X + (SETTINGS_W + SETTINGS_GAP) * cw, top)]
+    } else {
+        [(LAND_X, top), (LAND_X, top + (LOOK_ROWS as f32 + 1.5) * lh)]
     }
+}
+
+/// Where settings row `i` starts (its text; the bar begins 12 DIPs to the left): the line
+/// under its heading, general rows first, then the shortcuts.
+fn settings_at(i: usize, cw: f32, lh: f32, w: f32) -> (f32, f32) {
+    let heads = settings_heads(cw, lh, w);
+    let ((x, y), j) = if i < LOOK_ROWS { (heads[0], i) } else { (heads[1], i - LOOK_ROWS) };
+    (x, y + (j + 1) as f32 * lh)
 }
 
 /// The settings row (of `rows`) under `(x, y)`, for cells `cw` wide, rows `lh` tall, a page `w` wide.
@@ -3311,6 +3313,9 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
     ];
     for (act, k) in ACTIONS.iter().zip(s.keys) {
         rows.push((act.2.to_string(), k.map_or("none".into(), chord_text)));
+    }
+    for (head, (x, y)) in ["general", "shortcuts"].iter().zip(settings_heads(cw, lh, size.0)) {
+        line(head, x + 2.0 * cw, y, t.fg, 0.35);
     }
     let mut bottom: f32 = 0.0;
     for (i, (label, value)) in rows.iter().enumerate() {
@@ -4657,15 +4662,20 @@ fn check() {
     assert_eq!(mouse_report(TermMode::NONE, 0, true, false, 0, (0, 0)), None);
     // Settings rows under the mouse: half a line between the look and the shortcuts, only across the bars.
     let (cw, lh) = (10.0, 30.0);
-    let row = |y: f32| settings_row((LAND_X, y), cw, lh, 14, 500.0);
-    assert_eq!((row(settings_y(0, lh) + 1.0), row(settings_y(1, lh) + 29.0), row(settings_y(3, lh) + 1.0)), (Some(0), Some(1), Some(3)));
-    assert_eq!((row(settings_y(3, lh) - 1.0), row(settings_y(0, lh) - 1.0), row(settings_y(14, lh) + 1.0)), (None, None, None));
-    assert_eq!(settings_row((LAND_X + SETTINGS_W * cw, settings_y(0, lh) + 1.0), cw, lh, 14, 500.0), None);
-    // A wide page: the rows from SETTINGS_SPLIT on fill a right column from the top.
+    // Narrow page: "general" heading and rows, then the "shortcuts" heading half a line lower.
+    let narrow = 500.0;
+    let y = |i| settings_at(i, cw, lh, narrow).1;
+    let row = |y: f32| settings_row((LAND_X, y), cw, lh, 14, narrow);
+    assert_eq!(y(0), LAND_Y + 3.0 * lh); // under the title and the heading
+    assert_eq!(y(LOOK_ROWS), y(LOOK_ROWS - 1) + 2.5 * lh); // half a line, then the shortcuts heading
+    assert_eq!((row(y(0) + 1.0), row(y(1) + 29.0), row(y(3) + 1.0)), (Some(0), Some(1), Some(3)));
+    assert_eq!((row(y(3) - 1.0), row(y(0) - 1.0), row(y(13) + lh + 1.0)), (None, None, None));
+    assert_eq!(settings_row((LAND_X + SETTINGS_W * cw, y(0) + 1.0), cw, lh, 14, narrow), None);
+    // Wide page: general on the left, shortcuts in a right column from the same top.
     let (wide, right) = (2000.0, LAND_X + (SETTINGS_W + SETTINGS_GAP) * cw);
-    assert_eq!((settings_at(SETTINGS_SPLIT - 1, cw, lh, wide), settings_at(SETTINGS_SPLIT, cw, lh, wide)), ((LAND_X, settings_y(SETTINGS_SPLIT - 1, lh)), (right, settings_y(0, lh))));
-    assert_eq!(settings_at(SETTINGS_SPLIT, cw, lh, 900.0), (LAND_X, settings_y(SETTINGS_SPLIT, lh))); // too narrow: one column
-    assert_eq!((settings_row((right, settings_y(0, lh) + 1.0), cw, lh, 14, wide), settings_row((LAND_X, settings_y(0, lh) + 1.0), cw, lh, 14, wide)), (Some(SETTINGS_SPLIT), Some(0)));
+    assert_eq!(settings_heads(cw, lh, wide), [(LAND_X, LAND_Y + 2.0 * lh), (right, LAND_Y + 2.0 * lh)]);
+    assert_eq!((settings_at(0, cw, lh, wide), settings_at(LOOK_ROWS, cw, lh, wide)), ((LAND_X, y(0)), (right, y(0))));
+    assert_eq!((settings_row((right, y(0) + 1.0), cw, lh, 14, wide), settings_row((LAND_X, y(0) + 1.0), cw, lh, 14, wide)), (Some(LOOK_ROWS), Some(0)));
     let mut st = Settings::default();
     let sh = |name| Shell { name, exe: String::new(), args: Vec::new() };
     let found = [sh(DEFAULT_SHELL), sh("Command Prompt"), sh("Git Bash")];
