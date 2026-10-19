@@ -25,11 +25,11 @@ $frames = foreach ($s in 256, 64, 48, 40, 32, 24, 20, 16) {
     $path.CloseFigure()
     $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0x98, 0xC3, 0x79))), $path)  # One Half Dark green
     # The text is an outline path fitted by its ink bounds (not the font box): the wider side spans
-    # the tile minus a 14% margin, and the ink is centered both ways.
+    # the tile minus an 18% margin, and the ink is centered both ways.
     $glyphs = New-Object System.Drawing.Drawing2D.GraphicsPath
     $glyphs.AddString($Text, $fonts.Families[0], 0, 100, (New-Object System.Drawing.PointF 0, 0), [System.Drawing.StringFormat]::GenericTypographic)
     $b = $glyphs.GetBounds()
-    $k = $s * (1 - 2 * 0.14) / [math]::Max($b.Width, $b.Height)
+    $k = $s * (1 - 2 * 0.18) / [math]::Max($b.Width, $b.Height)
     $fit = New-Object System.Drawing.Drawing2D.Matrix
     $fit.Translate(($s - $b.Width * $k) / 2, ($s - $b.Height * $k) / 2)
     $fit.Scale($k, $k)
