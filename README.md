@@ -6,14 +6,14 @@
 
 <a href="https://github.com/Betadeimos/dterm/stargazers"><img src="https://img.shields.io/github/stars/Betadeimos/dterm" alt="GitHub stars"></a>
 <a href="https://github.com/Betadeimos/dterm/releases"><img src="https://img.shields.io/github/downloads/Betadeimos/dterm/total" alt="GitHub downloads"></a>
-<img src="https://img.shields.io/badge/binary-508_KB-success" alt="Binary size: 508 KB">
+<img src="https://img.shields.io/badge/binary-510_KB-success" alt="Binary size: 510 KB">
 <a href="LICENSE"><img src="https://img.shields.io/github/license/Betadeimos/dterm" alt="License"></a>
 <img src="https://img.shields.io/badge/Windows_10_%7C_11-native_Direct2D-0078D4" alt="Platform: Windows 10 | 11, native Direct2D">
 
-<p><b>The 508 KB Native Terminal Orchestrator for AI Builders.</b><br>
+<p><b>The 510 KB Native Terminal Orchestrator for AI Builders.</b><br>
 <b>Run multiple Claude Code, Codex, OpenCode, PowerShell or Git Bash sessions side-by-side in an auto-grid — zero Electron, instant start, automatic session restore.</b></p>
 
-<h3><a href="https://github.com/Betadeimos/dterm/releases/latest">Download dterm (508 KB .exe)</a></h3>
+<h3><a href="https://github.com/Betadeimos/dterm/releases/latest">Download dterm (510 KB .exe)</a></h3>
 
 </div>
 
@@ -118,7 +118,7 @@ Native Rust, Direct2D and DirectWrite, ConPTY.
 
 | | dterm | Electron/WebGL agent IDEs |
 |---|---|---|
-| Install | ~508 KB single .exe | 200+ MB |
+| Install | ~510 KB single .exe | 200+ MB |
 | RAM | ~15 MB | 500+ MB |
 | Rendering | Pure Direct2D + ConPTY | Chromium + WebGL |
 | Startup | Instant | Seconds |

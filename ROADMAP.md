@@ -23,6 +23,15 @@ shells and sessions (#13, #26, #27), look (#4, #5, #12), project (#6, #11, #22, 
 
 ## History
 
+**v0.3.2, the Right Conversation Release**
+- Two Claude Code panes in one folder no longer swap conversations: dterm reads the
+  `~/.claude/sessions/<pid>.json` that Claude Code keeps for each process and resumes exactly
+  that conversation, falling back to the newest unclaimed one for older Claude Code versions
+  ([#14](https://github.com/Betadeimos/dterm/issues/14)).
+- dterm started from a Claude Code session no longer passes that session's markers on to its
+  panes, so a claude started in a pane saves its conversation again
+  ([#28](https://github.com/Betadeimos/dterm/issues/28)).
+
 **v0.3.1, the Any Shell Release**
 - A fresh install starts in Windows PowerShell, so Git for Windows is no longer needed. A Shell
   row on the settings page picks Windows PowerShell, PowerShell 7, Command Prompt or Git Bash for
