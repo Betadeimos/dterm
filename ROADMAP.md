@@ -4,6 +4,16 @@ Goal: be a better daily terminal than Windows Terminal for people who run severa
 (and coding agents like Claude Code) side by side. Small native exe, zero config, looks like
 Windows Terminal, but built around the grid.
 
+## Next: Native Agent Orchestration (<500 KB)
+
+- [ ] **One-key git worktree pane:** spawn a new pane in a fresh git worktree branch and launch
+  an agent in it, with one shortcut.
+- [ ] **Multi-agent auto-resume (claude, codex, opencode, aider):** extend the process-tree
+  inspection that restores Claude Code today so it restores and tracks all major CLI coding agents.
+- [ ] **Broadcast input / prompt bar:** send a prompt or shell command to several panes at once.
+- [ ] **OSC 9/777 and OSC 133 agent hooks:** exact prompt-wait and task-completion signals per
+  pane, feeding the status dot.
+
 ## Feedback round 5 (done in v0.2.2)
 
 - [x] **Status you can see, without noise:** a solid 8 DIP dot before a pane's name (and before
