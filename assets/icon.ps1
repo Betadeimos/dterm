@@ -1,11 +1,15 @@
 # Draws a dterm icon: dark text on a green rounded square, saved as a multi-size .ico (and the
 # 256 px frame as icon.png for the README). The green tile stands out on dark and light taskbars.
-#   powershell -File assets\icon.ps1 -Text "D_" -Out icon.ico          (the current icon)
-#   powershell -File assets\icon.ps1 -Text ">_" -Out icon-prompt.ico   (the alternative)
+#   powershell -File assets\icon.ps1 -Text "D_" -Out icon.ico -Font JetBrainsMono-ExtraBold.ttf  (the current icon)
+#   powershell -File assets\icon.ps1 -Text ">_" -Out icon-prompt.ico -Font ...                   (the alternative)
 # Files are written next to this script. Then point dterm.rc at the .ico you want and rebuild
 # the resource from the project root:  rc.exe /fo dterm.res dterm.rc
-param([string]$Text = "D_", [string]$Out = "icon.ico")
+# -Font takes a .ttf; the current icon uses JetBrains Mono ExtraBold (OFL), from
+# https://github.com/JetBrains/JetBrainsMono/tree/v2.304/fonts/ttf
+param([string]$Text = "D_", [string]$Out = "icon.ico", [Parameter(Mandatory)][string]$Font)
 Add-Type -AssemblyName System.Drawing
+$fonts = New-Object System.Drawing.Text.PrivateFontCollection
+$fonts.AddFontFile((Resolve-Path $Font))
 # Every size Windows asks for at 100-200% scaling (taskbar 24 / 32 / 48, title bar 16 / 20 / 32,
 # Explorer up to 256), so none has to be resized and blurred.
 $frames = foreach ($s in 256, 64, 48, 40, 32, 24, 20, 16) {
@@ -20,22 +24,18 @@ $frames = foreach ($s in 256, 64, 48, 40, 32, 24, 20, 16) {
     $path.AddArc(0, $s - 2 * $r - 1, 2 * $r, 2 * $r, 90, 90)
     $path.CloseFigure()
     $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0x98, 0xC3, 0x79))), $path)  # One Half Dark green
-    # The text is an outline path, thickened by a stroke and fitted by its ink bounds into a square
-    # with the same margin on every side (so it is centered by what you see, not by the font box).
+    # The text is an outline path fitted by its ink bounds (not the font box): the wider side spans
+    # the tile minus a 14% margin, and the ink is centered both ways.
     $glyphs = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $glyphs.AddString($Text, (New-Object System.Drawing.FontFamily 'Cascadia Mono'), [int][System.Drawing.FontStyle]::Bold, 100, (New-Object System.Drawing.PointF 0, 0), [System.Drawing.StringFormat]::GenericTypographic)
-    $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::Black), 7
-    $pen.LineJoin = 'Round'
-    $b = $glyphs.GetBounds($null, $pen)
-    $m = $s * 0.22; $box = $s - 2 * $m
+    $glyphs.AddString($Text, $fonts.Families[0], 0, 100, (New-Object System.Drawing.PointF 0, 0), [System.Drawing.StringFormat]::GenericTypographic)
+    $b = $glyphs.GetBounds()
+    $k = $s * (1 - 2 * 0.14) / [math]::Max($b.Width, $b.Height)
     $fit = New-Object System.Drawing.Drawing2D.Matrix
-    $fit.Translate($m, $m)
-    $fit.Scale($box / $b.Width, $box / $b.Height)
+    $fit.Translate(($s - $b.Width * $k) / 2, ($s - $b.Height * $k) / 2)
+    $fit.Scale($k, $k)
     $fit.Translate(-$b.X, -$b.Y)
     $g.Transform = $fit
-    $dark = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0x1B, 0x1D, 0x23))  # One Half Dark gap color
-    $pen.Color = $dark.Color
-    $g.FillPath($dark, $glyphs); $g.DrawPath($pen, $glyphs)
+    $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0x1B, 0x1D, 0x23))), $glyphs)  # One Half Dark gap color
     $g.ResetTransform()
     if ($s -eq 256 -and $Out -eq 'icon.ico') { $bm.Save((Join-Path $PSScriptRoot 'icon.png'), [System.Drawing.Imaging.ImageFormat]::Png) }
     $ms = New-Object System.IO.MemoryStream
