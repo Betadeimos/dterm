@@ -133,7 +133,7 @@ Settings live in `%APPDATA%\dterm\settings`, a small text file you can also edit
 
 ## Status and roadmap
 
-Early, but in daily use. See [ROADMAP.md](ROADMAP.md) for what is next.
+Early, but in daily use. Open work is in [GitHub issues](https://github.com/Betadeimos/dterm/issues); the history is in [ROADMAP.md](ROADMAP.md).
 
 ## License
 

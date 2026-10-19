@@ -79,4 +79,4 @@ back in (`resume_command` checks).
 - Keep the README shortcut tables and the module doc comment at the top of `main.rs` in sync with behavior.
 - One focused change per pull request, and say what you tried by hand.
 
-Ideas and open work are in [ROADMAP.md](ROADMAP.md). Issues labeled **good first issue** are a fair place to start.
+Open work is tracked in [GitHub issues](https://github.com/Betadeimos/dterm/issues); [ROADMAP.md](ROADMAP.md) has the history and reasoning. Issues labeled **good first issue** are a fair place to start.

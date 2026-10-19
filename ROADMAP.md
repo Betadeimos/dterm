@@ -6,11 +6,30 @@ Windows Terminal, but built around the grid.
 
 ## Next
 
-- [ ] Launch an agent in the new worktree pane right away (pick which one).
-- [ ] Broadcast to a chosen set of panes, not only all of them.
-- [ ] Report mouse moves with no button held (mode 1003 hover).
-- [ ] Run `git worktree add` off the UI thread, so a big checkout doesn't freeze the window.
-- [ ] A GitHub Actions workflow that builds the release on tag push; font family and size in settings.
+Open work lives in [GitHub issues](https://github.com/Betadeimos/dterm/issues); this file keeps
+the history and the reasoning. The main open threads:
+
+- **Agents:** worktree pane launches an agent ([#7](https://github.com/Betadeimos/dterm/issues/7)),
+  npm-installed agents ([#15](https://github.com/Betadeimos/dterm/issues/15)), resume codex and
+  opencode sessions ([#16](https://github.com/Betadeimos/dterm/issues/16)), two Claude panes in one
+  folder ([#14](https://github.com/Betadeimos/dterm/issues/14)), flash the taskbar when a pane
+  needs you ([#20](https://github.com/Betadeimos/dterm/issues/20)).
+- **Panes and input:** broadcast to a chosen set ([#9](https://github.com/Betadeimos/dterm/issues/9)),
+  mouse hover reporting ([#10](https://github.com/Betadeimos/dterm/issues/10)), scrollback search
+  ([#18](https://github.com/Betadeimos/dterm/issues/18)), clickable links
+  ([#19](https://github.com/Betadeimos/dterm/issues/19)), Ctrl+Alt+1-9
+  ([#21](https://github.com/Betadeimos/dterm/issues/21)), worktree git off the UI thread
+  ([#8](https://github.com/Betadeimos/dterm/issues/8)).
+- **Shells and sessions:** PowerShell, cmd and WSL ([#17](https://github.com/Betadeimos/dterm/issues/17)),
+  scrollback in sessions ([#13](https://github.com/Betadeimos/dterm/issues/13)).
+- **Look:** themes ([#4](https://github.com/Betadeimos/dterm/issues/4)), landing page layout
+  ([#5](https://github.com/Betadeimos/dterm/issues/5)), font family and size
+  ([#12](https://github.com/Betadeimos/dterm/issues/12)).
+- **Project:** Linux and macOS ([#6](https://github.com/Betadeimos/dterm/issues/6)), modules
+  ([#22](https://github.com/Betadeimos/dterm/issues/22)), CI clippy and size budget
+  ([#23](https://github.com/Betadeimos/dterm/issues/23)), release on tag push
+  ([#11](https://github.com/Betadeimos/dterm/issues/11)), winget, Scoop and signing
+  ([#24](https://github.com/Betadeimos/dterm/issues/24)).
 
 ## The Native Agent Orchestrator Release (done in v0.3.0)
 
@@ -90,8 +109,9 @@ Windows Terminal, but built around the grid.
   used move over). Saved to `%APPDATA%\dterm\settings`.
 - [x] **Versions and releases:** shown on the landing page. `release.ps1` builds
   `dist\dterm-vX.Y.Z.exe` and `.zip`; `-Publish` tags and runs `gh release create`.
-- [x] Mouse support on the settings page (v0.3.0). Still open: a release workflow on tag push;
-  font family and size in settings.
+- [x] Mouse support on the settings page (v0.3.0). Still open: a release workflow on tag push
+  ([#11](https://github.com/Betadeimos/dterm/issues/11)); font family and size in settings
+  ([#12](https://github.com/Betadeimos/dterm/issues/12)).
 
 ## Requested features
 
@@ -134,7 +154,8 @@ Windows Terminal defaults in brackets, so muscle memory carries over.
 - [x] **Session restore + landing page.** On start, a terminal-style menu (like opencode):
       new session / last session / saved sessions. A session stores the layout, pane names and each
       pane's working directory. [WT: `persistedWindowLayout` restores layout and directories, not contents.]
-- [ ] Optionally save scrollback text per pane so a restored session shows what was there.
+- [ ] Optionally save scrollback text per pane so a restored session shows what was there
+      ([#13](https://github.com/Betadeimos/dterm/issues/13)).
 
 ### Look
 - [x] **Keep the acrylic when the window is unfocused.** Today Windows swaps the backdrop for a solid
