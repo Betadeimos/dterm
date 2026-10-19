@@ -2306,7 +2306,7 @@ unsafe fn paint(hwnd: HWND) {
         let zoomed = IsZoomed(hwnd).as_bool();
         if let Some(page) = &a.page {
             rt.Clear(Some(&color(bg(), a.settings.opacity)));
-            draw_settings(a, page, rt, brush);
+            draw_settings(a, page, rt, brush, (w as f32 / s, h as f32 / s - CAPTION_H));
             draw_caption(a, rt, brush, w as f32 / s, zoomed);
             end_draw(hwnd, &mut a.target);
             return;
@@ -2402,7 +2402,7 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
     if let Ok(big) = text_format(&a.dw, DWRITE_FONT_WEIGHT_BOLD, LOGO_SIZE) {
         let r = rect(LAND_X, LAND_Y, 4000.0, LOGO_SIZE * 1.4);
         text("D_", &big, r, theme().ansi[2], 1.0);
-        text("   dterm", &big, r, theme().fg, 0.95); // monospace: three cells to the right of "D_"
+        text("  term", &big, r, 0xFFFFFF, 1.0); // monospace: right after the two cells of "D_"
     }
     let tagline = format!("terminals in a grid, sessions that come back  \u{b7}  v{}", env!("CARGO_PKG_VERSION"));
     let live = l.rows.iter().any(|r| r.kind == Kind::Live);
@@ -2540,14 +2540,13 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
         }
     }
 
-    // The footer: the keys that drive dterm, the configurable ones as set on the settings page.
-    let mut hints = vec![
-        "\u{2191}\u{2193} choose".to_string(),
-        "Enter open".into(),
-        format!("Esc {}", if live { "back" } else { "new" }),
-        "F2 rename".into(),
-        "Del delete".into(),
-    ];
+    let hints = ["\u{2191}\u{2193} choose", "Enter open", if live { "Esc back" } else { "Esc new" }, "F2 rename", "Del delete"];
+    draw_footer(a, rt, brush, (width, height), hints.map(String::from).to_vec());
+}
+
+/// The footer bar of the landing and settings pages: the page's own keys (`hints`), then the
+/// shortcuts that drive dterm, as set on the settings page. `(width, height)` is the page, in DIPs.
+unsafe fn draw_footer(a: &App, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, (width, height): (f32, f32), mut hints: Vec<String>) {
     for (act, what) in [(Action::Save, "save session"), (Action::Home, "start page"), (Action::Settings, "settings")] {
         hints.extend(a.settings.keys[act as usize].map(|k| format!("{} {what}", chord_text(k))));
     }
@@ -2558,7 +2557,10 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
     rt.FillRectangle(&rect(0.0, top, width, 1.0), brush);
     if let Ok(small) = text_format(&a.dw, DWRITE_FONT_WEIGHT_NORMAL, TAB_SIZE) {
         let _ = small.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        text(&hints.join("   \u{b7}   "), &small, rect(LAND_X, top, (width - LAND_X - 12.0).max(0.0), FOOT_H), theme().fg, 0.35);
+        brush.SetColor(&color(fg(), 0.35));
+        let units: Vec<u16> = hints.join("   \u{b7}   ").encode_utf16().collect();
+        let r = rect(LAND_X, top, (width - LAND_X - 12.0).max(0.0), FOOT_H);
+        rt.DrawText(&units, &small, &r, brush, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
     }
 }
 
@@ -3174,7 +3176,7 @@ unsafe fn settings_mouse(hwnd: HWND, msg: u32, wp: WPARAM) {
 
 /// The settings page, in the style of the landing page: a title, then a row per setting with its
 /// value (the selected one bright with a green ❯), the keys, and the shortcuts that can't change.
-unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush) {
+unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget, brush: &ID2D1SolidColorBrush, size: (f32, f32)) {
     let (cw, ch) = a.cell;
     let lh = land_line(ch);
     let line = |s: &str, x: f32, y: f32, c: u32, alpha: f32| {
@@ -3208,17 +3210,18 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
         line(&value, value_x, y, if on && page.capture { t.ansi[3] } else { t.fg }, if on { 0.9 } else { 0.45 });
     }
     let y = settings_y(rows.len(), lh) + lh;
-    let keys = if page.capture {
-        "press a key with Ctrl or Alt   Esc or click cancel"
+    line("fixed: Alt+arrows focus   Alt+Shift+arrows resize   Ctrl+Alt+arrows swap   Ctrl+Tab next pane", LAND_X, y, t.fg, 0.25);
+    line("Shift+arrows select (Ctrl: by word)   Ctrl+C / Ctrl+V copy, paste   Ctrl+Plus / Minus / 0 font", LAND_X, y + lh, t.fg, 0.25);
+    line("Shift+drag selects in apps that take the mouse (vim, tmux, htop)", LAND_X, y + 2.0 * lh, t.fg, 0.25);
+    // The keys of this page, in the footer bar like the landing page's.
+    let hints: &[&str] = if page.capture {
+        &["press a key with Ctrl or Alt", "Esc or click cancel"]
     } else if page.sel < 2 {
-        "\u{2191}\u{2193} choose   \u{2190}\u{2192} change (or click \u{2039} \u{203a}, wheel)   Esc back"
+        &["\u{2191}\u{2193} choose", "\u{2190}\u{2192} change (or click \u{2039} \u{203a}, wheel)", "Esc back"]
     } else {
-        "\u{2191}\u{2193} choose   Enter or click: new keys   Del or right-click: default   Esc back"
+        &["\u{2191}\u{2193} choose", "Enter or click new keys", "Del or right-click default", "Esc back"]
     };
-    line(keys, LAND_X, y, t.fg, 0.4);
-    line("fixed: Alt+arrows focus   Alt+Shift+arrows resize   Ctrl+Alt+arrows swap   Ctrl+Tab next pane", LAND_X, y + lh, t.fg, 0.25);
-    line("Shift+arrows select (Ctrl: by word)   Ctrl+C / Ctrl+V copy, paste   Ctrl+Plus / Minus / 0 font", LAND_X, y + 2.0 * lh, t.fg, 0.25);
-    line("Shift+drag selects in apps that take the mouse (vim, tmux, htop)", LAND_X, y + 3.0 * lh, t.fg, 0.25);
+    draw_footer(a, rt, brush, size, hints.iter().map(|h| h.to_string()).collect());
 }
 
 /// Enter in the prompt: save under the typed name and say so for a moment, or open the worktree pane.
