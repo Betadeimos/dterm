@@ -167,6 +167,7 @@ AltGr+key types a character on your layout, that character wins, and left Ctrl +
 | Keys | Action |
 | --- | --- |
 | `Ctrl+Alt+T` * | Add a pane (splits the largest one) |
+| `Ctrl+Alt+Shift+T` * | Add a pane in another shell: `Left` / `Right` pick it, Enter (`Esc` cancels); sessions keep each pane's shell |
 | `Ctrl+Alt+Plus` / `Ctrl+Alt+Minus` * | Split the focused pane right / below (also `Alt+Shift+Plus` / `Minus`) |
 | `Ctrl+Alt+W` *, or `exit` | Close the pane |
 | `Ctrl+Alt+R` * | Rename the focused pane |
