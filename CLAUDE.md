@@ -43,7 +43,8 @@ Drafts of the Reddit and Show HN posts are in `launch-posts.md` (local only, lis
 `.git/info/exclude`). Before posting, re-check every number in them against the current release.
 
 **Where things stand**
-- v0.3.2 (522,240 bytes, ~510 KB) is the release to launch with. It fixed #14 (two Claude panes in
+- v0.3.3 (524,800 bytes, ~513 KB) is the release to launch with: it adds per-pane shells (#26)
+  and Ctrl+Alt+1 … 9 (#21). v0.3.2 fixed #14 (two Claude panes in
   one folder swapped conversations) and ships `SHA256SUMS.txt`. The README explains the
   SmartScreen warning, since the exe is not signed (#24).
 - Reddit: the account is 6 years old but has almost no karma, and r/ClaudeCode blocks posting
@@ -55,7 +56,7 @@ Drafts of the Reddit and Show HN posts are in `launch-posts.md` (local only, lis
   have 100+ stars: dterm qualifies from **2026-10-30**. Only a human, through the web form
   (https://github.com/hesreallyhim/awesome-claude-code/issues/new?template=recommend-resource.yml),
   never `gh` or a PR. Category `Agent Orchestration`. Description: "Native Windows terminal
-  (single ~510 KB exe) that tiles Claude Code sessions in an auto-grid, marks background panes as
+  (single ~513 KB exe) that tiles Claude Code sessions in an auto-grid, marks background panes as
   working, done or waiting for input, and resumes each pane's conversation with claude --resume
   after a restart." Tick every checklist box except the last one (a trap).
 - jqueryscript/awesome-claude-code merges nothing new and lists only projects with many stars:

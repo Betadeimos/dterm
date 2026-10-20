@@ -23,6 +23,13 @@ shells and sessions (#13, #26, #27), look (#4, #5, #12), project (#6, #11, #22, 
 
 ## History
 
+**v0.3.3, the Mixed Shells Release**
+- Ctrl+Alt+Shift+T opens a pane in any installed shell (Left / Right pick it in the prompt bar),
+  so Git Bash and PowerShell panes can share a grid; sessions bring each pane back in its own shell
+  ([#26](https://github.com/Betadeimos/dterm/issues/26)).
+- Ctrl+Alt+1 … 9 focus the Nth pane in tab order, and holding Ctrl+Alt shows the numbers
+  ([#21](https://github.com/Betadeimos/dterm/issues/21), [#29](https://github.com/Betadeimos/dterm/issues/29)).
+
 **v0.3.2, the Right Conversation Release**
 - Two Claude Code panes in one folder no longer swap conversations: dterm reads the
   `~/.claude/sessions/<pid>.json` that Claude Code keeps for each process and resumes exactly
