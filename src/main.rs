@@ -3,6 +3,7 @@
 //! Terminal emulation and ConPTY come from alacritty_terminal. Panes run Windows PowerShell, or
 //! the shell picked on the settings page (PowerShell 7, Command Prompt, Git Bash, if installed).
 //! Shortcuts (the defaults; the settings page changes them): Ctrl+Alt+T splits the largest pane,
+//! Ctrl+Alt+Shift+T does too in a shell picked with Left / Right (each pane keeps its shell in sessions),
 //! Ctrl+Alt+Plus / Ctrl+Alt+Minus (or Alt+Shift+Plus / Minus, as in Windows Terminal) split the
 //! focused one side by side / top and bottom, Ctrl+Alt+W (or `exit`) closes a pane, Ctrl+Alt+R
 //! renames it (Enter confirms, Esc cancels, empty resets), Ctrl+Alt+Z zooms it to the whole window,
@@ -657,6 +658,7 @@ fn zoomed(size: f32, step: i32) -> f32 {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Action {
     NewPane,
+    NewPaneIn,
     SplitRight,
     SplitDown,
     Close,
@@ -672,8 +674,9 @@ enum Action {
 
 /// Each action's id in the settings file, its name on the settings page, and its default keys.
 /// The settings page lists them in this order.
-const ACTIONS: [(Action, &str, &str, &str); 12] = [
+const ACTIONS: [(Action, &str, &str, &str); 13] = [
     (Action::NewPane, "new-pane", "New pane", "Ctrl+Alt+T"),
+    (Action::NewPaneIn, "new-pane-in", "New pane in shell", "Ctrl+Alt+Shift+T"),
     (Action::SplitRight, "split-right", "Split right", "Ctrl+Alt+Plus"),
     (Action::SplitDown, "split-down", "Split below", "Ctrl+Alt+Minus"),
     (Action::Close, "close-pane", "Close pane", "Ctrl+Alt+W"),
@@ -807,13 +810,14 @@ fn parse_settings(text: &str) -> Settings {
     s
 }
 
-/// A pane in a saved session: its folder, its typed name, and the command that brings back the
-/// program it was running (see `resume_command`). Any of them may be empty.
+/// A pane in a saved session: its folder, its typed name, the command that brings back the
+/// program it was running (see `resume_command`), and its shell's name. Any of them may be empty.
 #[derive(Debug, PartialEq, Default, Clone)]
 struct SavedPane {
     cwd: String,
     name: String,
     run: String,
+    shell: String,
 }
 
 /// A saved session: the split tree (its leaves index `panes`, in tree order), the panes, the
@@ -876,7 +880,8 @@ fn ago(t: u64) -> String {
 }
 
 /// Session file text: a header, then the tree in pre-order (a `split` line is followed by its two
-/// children). A pane line is `pane <folder>\t<name>`, then `\t<command>` when it has one.
+/// children). A pane line is `pane <folder>\t<name>`, then `\t<command>` when it has one or a
+/// shell, then `\t<shell>` when it has one (files from before have none: the settings shell).
 fn session_text(s: &Session) -> String {
     fn node(n: &Node, panes: &[SavedPane], out: &mut String) {
         match n {
@@ -884,8 +889,11 @@ fn session_text(s: &Session) -> String {
                 let p = panes.get(*i).cloned().unwrap_or_default();
                 let clean = |t: &str| t.replace(['\t', '\r', '\n'], " ");
                 out.push_str(&format!("pane {}\t{}", clean(&p.cwd), clean(&p.name)));
-                if !p.run.is_empty() {
+                if !p.run.is_empty() || !p.shell.is_empty() {
                     out.push_str(&format!("\t{}", clean(&p.run)));
+                }
+                if !p.shell.is_empty() {
+                    out.push_str(&format!("\t{}", clean(&p.shell)));
                 }
                 out.push('\n');
             }
@@ -916,7 +924,7 @@ fn parse_session(text: &str) -> Option<Session> {
         if let Some(rest) = line.strip_prefix("pane ") {
             let mut fields = rest.split('\t').map(|f| f.trim().to_string());
             let mut field = || fields.next().unwrap_or_default();
-            panes.push(SavedPane { cwd: field(), name: field(), run: field() });
+            panes.push(SavedPane { cwd: field(), name: field(), run: field(), shell: field() });
             return Some(Node::Leaf(panes.len() - 1));
         }
         let mut parts = line.strip_prefix("split ")?.split(' ');
@@ -1621,6 +1629,7 @@ struct Pane {
     activity: Arc<Activity>,
     status: Status,             // shown while the pane is not focused
     agent: Option<&'static str>, // coding agent running in it, see `sync_agents`
+    shell: &'static str,        // the `Shell` name it runs
 }
 
 impl Pane {
@@ -1757,12 +1766,13 @@ struct App {
     report: Option<(usize, u8, Point)>, // a button reported to the app in pane id: the button, the last cell sent
 }
 
-/// What the one-line prompt near the bottom asks for: a name to save the session under, or the
-/// branch of a new worktree pane.
+/// What the one-line prompt near the bottom asks for: a name to save the session under, the
+/// branch of a new worktree pane, or the shell (index into `shells`) of a new pane.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Ask {
     Save,
     Worktree,
+    Shell(usize),
 }
 
 /// The settings page: the selected row (theme, opacity, shell, then one per action) and whether it waits
@@ -1776,6 +1786,11 @@ impl App {
     /// The shell new panes run.
     fn shell(&self) -> &Shell {
         pick_shell(&self.shells, &self.settings.shell)
+    }
+
+    /// The installed shell called `name`, else the settings shell.
+    fn shell_named(&self, name: &str) -> &Shell {
+        self.shells.iter().find(|s| s.name.eq_ignore_ascii_case(name)).unwrap_or_else(|| self.shell())
     }
 
     /// Whether panes reserve a label slot: with several panes, or while a lone one is renamed.
@@ -1824,7 +1839,8 @@ impl App {
                 let p = self.panes.iter().find(|p| p.id == *id);
                 let cwd = p.and_then(|p| p.names.lock().ok()?.win.clone()).unwrap_or_default();
                 let run = p.and_then(|p| agent_run(&procs, p.pid?, &cwd, &mut taken)).unwrap_or_default();
-                SavedPane { cwd, name: p.and_then(|p| p.custom.clone()).unwrap_or_default(), run }
+                let shell = p.map(|p| p.shell.to_string()).unwrap_or_default();
+                SavedPane { cwd, name: p.and_then(|p| p.custom.clone()).unwrap_or_default(), run, shell }
             })
             .collect();
         let focused = self.panes.get(self.focus).map(|p| p.id);
@@ -2082,7 +2098,7 @@ fn spawn(hwnd: HWND, id: usize, shell: &Shell, cell: (f32, f32), scale: f32, dir
     let tx = event_loop.channel();
     let _ = slot.set(tx.clone());
     event_loop.spawn();
-    Ok(Pane { id, term, tx, size, rect: (0.0, 0.0, 0.0, 0.0), origin: (PAD, PAD), head: None, names, custom: None, pid, activity, status: Status::Idle, agent: None })
+    Ok(Pane { id, term, tx, size, rect: (0.0, 0.0, 0.0, 0.0), origin: (PAD, PAD), head: None, names, custom: None, pid, activity, status: Status::Idle, agent: None, shell: shell.name })
 }
 
 unsafe fn scale(hwnd: HWND) -> f32 {
@@ -2155,16 +2171,18 @@ unsafe fn layout(hwnd: HWND) {
 /// Open a shell in a new pane that gets the focus. `Some(side_by_side)` splits the focused pane
 /// that way; `None` splits the largest one along its longer side (and starts the first pane).
 unsafe fn add_pane(hwnd: HWND, dir: Option<bool>) {
-    add_pane_in(hwnd, dir, None);
+    add_pane_in(hwnd, dir, None, None);
 }
 
-/// `add_pane` with the shell started in folder `cwd` (the home folder when `None`). True when it started.
-unsafe fn add_pane_in(hwnd: HWND, dir: Option<bool>, cwd: Option<&str>) -> bool {
+/// `add_pane` with the shell started in folder `cwd` (the home folder when `None`), running the
+/// shell called `shell` (the settings shell when `None`). True when it started.
+unsafe fn add_pane_in(hwnd: HWND, dir: Option<bool>, cwd: Option<&str>, shell: Option<&str>) -> bool {
     let s = scale(hwnd);
+    let name = with(|a| shell.map_or(a.shell(), |n| a.shell_named(n)).name);
     let added = with(|a| {
         let id = a.next_id;
         a.next_id += 1;
-        let Ok(p) = spawn(hwnd, id, a.shell(), a.cell, s, cwd) else { return false };
+        let Ok(p) = spawn(hwnd, id, a.shell_named(name), a.cell, s, cwd) else { return false };
         let (at, side_by_side) = match dir {
             Some(d) => (a.focus, d),
             None => auto_split(&a.panes.iter().map(|p| p.rect).collect::<Vec<_>>(), a.focus),
@@ -2183,7 +2201,7 @@ unsafe fn add_pane_in(hwnd: HWND, dir: Option<bool>, cwd: Option<&str>) -> bool 
     if added {
         layout(hwnd);
     } else if with(|a| !a.panes.is_empty()) {
-        toast(hwnd, format!("could not start {}", with(|a| a.shell().name))); // with no panes, the callers say so
+        toast(hwnd, format!("could not start {name}")); // with no panes, the callers say so
     }
     added
 }
@@ -2494,8 +2512,12 @@ unsafe fn paint(hwnd: HWND) {
         }
         draw_chrome(a, rt, brush, w as f32 / s);
         // The save-session or worktree prompt, or the note after saving: one small line near the bottom.
-        let ask = |k: &Ask| if *k == Ask::Save { "save session as" } else { "worktree branch" };
-        let note = a.prompt.as_ref().map(|(k, t)| (format!("{}: {t}\u{258f}", ask(k)), 0.9)).or(a.toast.clone().map(|t| (t, 0.6)));
+        let ask = |k: &Ask, t: &str| match k {
+            Ask::Save => format!("save session as: {t}\u{258f}"),
+            Ask::Worktree => format!("worktree branch: {t}\u{258f}"),
+            Ask::Shell(i) => format!("new pane in: \u{2039} {} \u{203a}", a.shells.get(*i).map_or("", |s| s.name)),
+        };
+        let note = a.prompt.as_ref().map(|(k, t)| (ask(k, t), 0.9)).or(a.toast.clone().map(|t| (t, 0.6)));
         if let Some((text, alpha)) = note {
             let (cw, ch) = (w as f32 / s, h as f32 / s - CAPTION_H);
             let bw = 380f32.min(cw - 16.0);
@@ -3011,7 +3033,7 @@ unsafe fn open_session(hwnd: HWND, s: Session) -> bool {
         let mut panes = Vec::new();
         for (i, saved) in s.panes.iter().enumerate() {
             let dir = Some(saved.cwd.as_str()).filter(|c| !c.is_empty());
-            let Ok(mut p) = spawn(hwnd, base + i, a.shell(), a.cell, scale, dir) else {
+            let Ok(mut p) = spawn(hwnd, base + i, a.shell_named(&saved.shell), a.cell, scale, dir) else {
                 panes.iter().for_each(|p: &Pane| drop(p.tx.send(Msg::Shutdown)));
                 return false;
             };
@@ -3390,10 +3412,15 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
     draw_footer(a, rt, brush, size, hints.iter().map(|h| h.to_string()).collect());
 }
 
-/// Enter in the prompt: save under the typed name and say so for a moment, or open the worktree pane.
+/// Enter in the prompt: save under the typed name and say so for a moment, or open the worktree
+/// pane, or the pane in the chosen shell.
 unsafe fn end_prompt(hwnd: HWND, keep: bool) {
     let (ask, typed) = with(|a| a.prompt.take()).unzip();
-    if keep && ask == Some(Ask::Worktree) {
+    if let (true, Some(Ask::Shell(i))) = (keep, ask) {
+        let name = with(|a| a.shells.get(i).map(|s| s.name));
+        leave_zoom(hwnd);
+        add_pane_in(hwnd, None, None, name);
+    } else if keep && ask == Some(Ask::Worktree) {
         open_worktree(hwnd, typed.unwrap_or_default().trim());
     } else if let (true, Some(name)) = (keep, typed.as_deref().and_then(session_file_name)) {
         let file = session_path(&name).filter(|f| save_session(f));
@@ -3479,7 +3506,7 @@ unsafe fn open_worktree(hwnd: HWND, name: &str) {
     match made {
         Ok(dir) => {
             leave_zoom(hwnd);
-            if add_pane_in(hwnd, None, dir.to_str()) {
+            if add_pane_in(hwnd, None, dir.to_str(), None) {
                 with(|a| a.panes.last_mut().map(|p| p.custom = Some(name.into())));
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
@@ -3567,6 +3594,14 @@ unsafe fn run(hwnd: HWND, act: Action) {
             };
             add_pane(hwnd, dir);
         }
+        // The prompt picks the shell, starting at the settings one; Enter opens the pane.
+        Action::NewPaneIn => {
+            with(|a| {
+                let at = a.shells.iter().position(|s| s.name == a.shell().name).unwrap_or(0);
+                (a.prompt, a.toast) = (Some((Ask::Shell(at), String::new())), None);
+            });
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
         Action::Close => {
             if let Some(id) = with(|a| a.panes.get(a.focus).map(|p| p.id)) {
                 leave_zoom(hwnd);
@@ -3653,6 +3688,16 @@ unsafe fn on_key(hwnd: HWND, vk: u16, scan: u32) -> bool {
                     with(|a| {
                         if let Some((_, t)) = a.prompt.as_mut() {
                             t.pop();
+                        }
+                    });
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                // Left / Right (and Up / Down) step through the shells.
+                0x25..=0x28 => {
+                    with(|a| {
+                        let n = a.shells.len();
+                        if let Some((Ask::Shell(i), _)) = a.prompt.as_mut() {
+                            *i = cycle(n, *i, if matches!(vk, 0x25 | 0x26) { -1 } else { 1 });
                         }
                     });
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -3854,8 +3899,8 @@ unsafe fn on_char(unit: u16, alt: bool) {
             }
             return;
         }
-        if let Some((_, typed)) = a.prompt.as_mut() {
-            if !alt && !s.chars().any(char::is_control) && typed.chars().count() < PROMPT_MAX {
+        if let Some((ask, typed)) = a.prompt.as_mut() {
+            if !matches!(ask, Ask::Shell(_)) && !alt && !s.chars().any(char::is_control) && typed.chars().count() < PROMPT_MAX {
                 typed.push_str(&s);
             }
             return;
@@ -4777,14 +4822,16 @@ fn check() {
         a: Box::new(Node::Leaf(0)),
         b: Box::new(Node::Split { side_by_side: false, ratio: 0.5, a: Box::new(Node::Leaf(1)), b: Box::new(Node::Leaf(2)) }),
     };
-    let pane = |cwd: &str, name: &str, run: &str| SavedPane { cwd: cwd.into(), name: name.into(), run: run.into() };
-    let panes = vec![pane("C:\\a b", "build", ""), pane("", "", "claude --resume 0a1b-2c"), pane("D:\\x", "", "")];
+    let pane = |cwd: &str, name: &str, run: &str| SavedPane { cwd: cwd.into(), name: name.into(), run: run.into(), shell: String::new() };
+    let bash = SavedPane { shell: "Git Bash".into(), ..pane("D:\\x", "", "") };
+    let panes = vec![pane("C:\\a b", "build", ""), pane("", "", "claude --resume 0a1b-2c"), bash];
     let s = Session { view: View::Tabs, font: 18.0, focus: 2, tree, panes, created: 1_700_000_000, closed: 1_700_003_600 };
     let text = session_text(&s);
     assert!(text.starts_with(
         "dterm-session 1\nview tabs\nfont 18\nfocus 2\ncreated 1700000000\nclosed 1700003600\nsplit side 0.250\npane C:\\a b\tbuild\n"
     ));
     assert!(text.contains("pane \t\tclaude --resume 0a1b-2c\n")); // the command only when there is one
+    assert!(text.ends_with("pane D:\\x\t\t\tGit Bash\n")); // the shell after an empty command
     assert_eq!(parse_session(&text), Some(s));
     assert!(parse_session(&text.replace("\n", "\r\n")).is_some()); // Notepad line breaks
     // Leaves get renumbered in tree order, whatever their ids were.
