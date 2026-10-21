@@ -25,13 +25,18 @@ $frames = foreach ($s in 256, 64, 48, 40, 32, 24, 20, 16) {
     $path.CloseFigure()
     $g.FillPath((New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(0x98, 0xC3, 0x79))), $path)  # One Half Dark green
     # The text is an outline path fitted by its ink bounds (not the font box): the wider side spans
-    # the tile minus an 18% margin, and the ink is centered both ways.
+    # the tile minus an 18% margin, and the ink is centered both ways, then nudged (H1, #31).
     $glyphs = New-Object System.Drawing.Drawing2D.GraphicsPath
     $glyphs.AddString($Text, $fonts.Families[0], 0, 100, (New-Object System.Drawing.PointF 0, 0), [System.Drawing.StringFormat]::GenericTypographic)
     $b = $glyphs.GetBounds()
     $k = $s * (1 - 2 * 0.18) / [math]::Max($b.Width, $b.Height)
+    # H1: 2.5 px left and 2% of the tile up at 256 px; both scale with the tile. At 16 to 64 px the
+    # ink's left and top edges snap to whole pixels, so the taskbar and title bar stay crisp.
+    $left = ($s - $b.Width * $k) / 2 - 0.0098 * $s
+    $top = ($s - $b.Height * $k) / 2 - 0.02 * $s
+    if ($s -le 64) { $left = [math]::Floor($left + 0.5); $top = [math]::Floor($top + 0.5) }
     $fit = New-Object System.Drawing.Drawing2D.Matrix
-    $fit.Translate(($s - $b.Width * $k) / 2, ($s - $b.Height * $k) / 2)
+    $fit.Translate($left, $top)
     $fit.Scale($k, $k)
     $fit.Translate(-$b.X, -$b.Y)
     $g.Transform = $fit
