@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dterm icon lab</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@700&family=Fira+Code:wght@700&family=Roboto+Mono:wght@700&family=Source+Code+Pro:wght@900&family=Space+Mono:wght@700&family=Martian+Mono:wght@800&family=Geist+Mono:wght@800&family=Red+Hat+Mono:wght@700&family=Ubuntu+Mono:wght@700&family=Azeret+Mono:wght@800&family=DM+Mono:wght@500&family=Inter:wght@900&family=Space+Grotesk:wght@700&family=Manrope:wght@800&family=Outfit:wght@800&display=block">
+<style>
+  :root { --bg: #15171c; --card: #1e2128; --line: #2c313a; --fg: #d7dae0; --dim: #8b919c; --accent: #98c379; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, sans-serif; }
+  main { max-width: 1400px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 40px 0 4px; color: var(--accent); }
+  p, li { color: var(--dim); max-width: 900px; }
+  .notes li { margin: 2px 0; }
+  .bar { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin: 12px 0; color: var(--dim); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-top: 12px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .card h3 { font-size: 14px; margin: 0; color: var(--fg); }
+  .card h3 b { color: var(--accent); margin-right: 6px; }
+  .card .note { font-size: 12px; color: var(--dim); min-height: 36px; margin: 2px 0 8px; }
+  .row { display: flex; gap: 12px; align-items: flex-end; }
+  .big { width: 160px; height: 160px; }
+  .side { display: flex; flex-direction: column; gap: 6px; font-size: 11px; color: var(--dim); }
+  .zoom { image-rendering: pixelated; }
+  .strip { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border-radius: 6px; margin-top: 8px; }
+  .strip.dark { background: #202020; }
+  .strip.light { background: #eeeeee; }
+  .meas { font: 11px ui-monospace, monospace; color: var(--dim); margin-top: 6px; }
+  .missing { color: #e06c75; }
+</style>
+</head>
+<body>
+<main>
+<h1>dterm icon lab: D_ balance</h1>
+<p>Issue #31. Colors stay: tile #98C379, ink #1B1D23, corner radius 20%. Every card is rendered live with the same method as <code>assets/icon.ps1</code>: the ink is measured, fitted by its wider side into the tile minus the margin, then placed. Small tiles are drawn at their real pixel size (not scaled down from 256), so the 24 and 16 px strips show what the taskbar and title bar would show. Tell me the IDs you like (for example "A3, B2, D6") and I will narrow down from there.</p>
+
+<h2>What the theory says, applied to D_</h2>
+<ul class="notes">
+  <li><b>We see mass, not boxes.</b> Software centers the bounding box; the eye centers visual weight. Asymmetric shapes (play buttons, letters) need a nudge so they look centered.</li>
+  <li><b>D_ is lopsided by nature.</b> The D fills the full height on the left, the underscore only the bottom right, so the top-right corner is empty. The bounding box is centered, the ink is not: its center of mass sits left of and below the box center. Group A tests ways to place it by mass.</li>
+  <li><b>The optical center sits slightly above the geometric center.</b> Things placed at the exact middle look a little low. Variants with "lift" raise it by 1 to 3% of the tile.</li>
+  <li><b>Round sides look smaller than flat sides.</b> The D has a flat stem on the left and a round bowl on the right (the reason type uses overshoot). The left edge reads as "harder" and nearer.</li>
+  <li><b>Small first.</b> Strokes must stay at least 1 px at 16 px, details snap to whole pixels, shapes stay simple. Group G snaps the stem and the bar to the pixel grid.</li>
+  <li><b>Windows:</b> app icons are drawn on a 48 px grid, keep a balanced silhouette with no extremes of thick and thin, and avoid typography unless essential. For us the letters are the mark, so they have to be as solid as a shape.</li>
+</ul>
+
+<div class="bar">
+  <label><input type="checkbox" id="guides"> show guides (red: ink box, cyan: tile center, yellow dot: ink center of mass)</label>
+  <span id="status">loading fonts…</span>
+</div>
+
+<div id="sheet"></div>
+
+<p style="margin-top:40px">Sources: <a href="https://blog.icons8.com/articles/why-great-designers-break-alignment-rules/">icons8, alignment rules</a> ·
+<a href="https://railsdesigner.com/mathematical-optical-alignment-design/">mathematical vs optical alignment</a> ·
+<a href="https://en.wikipedia.org/wiki/Overshoot_(typography)">overshoot</a> ·
+<a href="https://logogeek.uk/?p=2617">logo optical corrections</a> ·
+<a href="https://blog.thepapermillstore.com/designing-using-visual-center/">visual center</a> ·
+<a href="https://learn.microsoft.com/en-us/windows/apps/design/iconography/app-icon-design">Windows app icon guidelines</a> ·
+<a href="https://design.streamlinehq.com/16x16-icons">16x16 icons</a> ·
+<a href="https://designsystem.michelin.com/icons/brand/icons-pictograms/icons/usage">1 px minimum detail</a></p>
+</main>
+
+<script>
+const TILE = '#98C379', INK = '#1B1D23';
+const JB = 'JetBrains Mono';
+// Defaults: the current icon. mode 'glyph' uses the font's own underscore; 'bar' draws a rectangle
+// sized from the D (w: share of D width, t: share of D height, gap: share of D height,
+// y: 'base' = bottom flush with the D, 'below' = top just under the D).
+const base = { font: JB, weight: 800, mode: 'glyph', margin: 0.18, blend: 0, lift: 0, dx: 0, focus: 'all', snap: false,
+               bar: { w: 0.62, t: 'stem', gap: 0.10, y: 'base' } };
+const v = (id, title, note, o = {}) => ({ id, title, note, ...base, ...o, bar: { ...base.bar, ...(o.bar || {}) } });
+
+const groups = [
+  ['A. Centering', 'Same font and size as today; only the placement changes.', [
+    v('A1', 'Current icon', 'Ink box centered both ways (what ships today).'),
+    v('A2', 'Current, 1.5 px left', 'The literal ask of #31: 0.6% of the tile to the left.', { dx: -0.006 }),
+    v('A3', 'Half mass', 'Halfway between box center and center of mass.', { blend: 0.5 }),
+    v('A4', 'Full mass', 'Center of mass on the tile center.', { blend: 1 }),
+    v('A5', 'Box + lift 2%', 'Box centered, raised to the optical center.', { lift: 0.02 }),
+    v('A6', 'Half mass + lift 2%', 'A3 raised to the optical center.', { blend: 0.5, lift: 0.02 }),
+    v('A7', 'D centered', 'The D alone is centered; the underscore hangs to the right.', { focus: 'D' }),
+    v('A8', 'Between box and D', 'Halfway from A1 to A7.', { focus: 'half' }),
+  ]],
+  ['B. Underscore shape', 'JetBrains Mono ExtraBold D with a drawn bar instead of the font\'s underscore, placed at half mass.', [
+    v('B1', 'Bar on the baseline', 'Bottom flush with the D, stem-thick, 62% of D width.', { mode: 'bar', blend: 0.5 }),
+    v('B2', 'Bar below the baseline', 'Like a real underscore, stem-thick.', { mode: 'bar', blend: 0.5, bar: { y: 'below' } }),
+    v('B3', 'Short cursor', '40% of D width: reads as a cursor, less as a letter.', { mode: 'bar', blend: 0.5, bar: { w: 0.40 } }),
+    v('B4', 'Long bar', '85% of D width: the two parts weigh the same.', { mode: 'bar', blend: 0.5, bar: { w: 0.85 } }),
+    v('B5', 'Tight gap', 'Gap 4% of D height: one compact block.', { mode: 'bar', blend: 0.5, bar: { gap: 0.04 } }),
+    v('B6', 'Wide gap', 'Gap 18% of D height.', { mode: 'bar', blend: 0.5, bar: { gap: 0.18 } }),
+    v('B7', 'Thin bar', 'Bar 9% of D height, thinner than the stem.', { mode: 'bar', blend: 0.5, bar: { t: 0.09 } }),
+    v('B8', 'Block cursor', 'A solid block, half the D height: D▌.', { mode: 'bar', blend: 0.5, bar: { w: 0.36, t: 0.5, gap: 0.08 } }),
+  ]],
+  ['C. Weight', 'JetBrains Mono, half mass. Heavier holds up better at 16 px; lighter opens the D.', [
+    v('C1', 'Regular 400', '', { weight: 400, blend: 0.5 }),
+    v('C2', 'Medium 500', '', { weight: 500, blend: 0.5 }),
+    v('C3', 'SemiBold 600', '', { weight: 600, blend: 0.5 }),
+    v('C4', 'Bold 700', '', { weight: 700, blend: 0.5 }),
+    v('C5', 'ExtraBold 800', 'Today\'s weight.', { weight: 800, blend: 0.5 }),
+  ]],
+  ['D. Monospace fonts', 'Each font\'s own D and underscore, heaviest weight it has, half mass.', [
+    v('D1', 'JetBrains Mono 800', 'Today\'s font.', { blend: 0.5 }),
+    v('D2', 'IBM Plex Mono 700', '', { font: 'IBM Plex Mono', weight: 700, blend: 0.5 }),
+    v('D3', 'Fira Code 700', '', { font: 'Fira Code', weight: 700, blend: 0.5 }),
+    v('D4', 'Roboto Mono 700', '', { font: 'Roboto Mono', weight: 700, blend: 0.5 }),
+    v('D5', 'Source Code Pro 900', '', { font: 'Source Code Pro', weight: 900, blend: 0.5 }),
+    v('D6', 'Space Mono 700', '', { font: 'Space Mono', weight: 700, blend: 0.5 }),
+    v('D7', 'Martian Mono 800', 'Wide letters: fills a square tile well.', { font: 'Martian Mono', weight: 800, blend: 0.5 }),
+    v('D8', 'Geist Mono 800', '', { font: 'Geist Mono', weight: 800, blend: 0.5 }),
+    v('D9', 'Red Hat Mono 700', '', { font: 'Red Hat Mono', weight: 700, blend: 0.5 }),
+    v('D10', 'Ubuntu Mono 700', '', { font: 'Ubuntu Mono', weight: 700, blend: 0.5 }),
+    v('D11', 'Azeret Mono 800', '', { font: 'Azeret Mono', weight: 800, blend: 0.5 }),
+    v('D12', 'DM Mono 500', '', { font: 'DM Mono', weight: 500, blend: 0.5 }),
+    v('D13', 'Cascadia Mono 700', 'Windows Terminal\'s font (local, ships with Windows 11).', { font: 'Cascadia Mono', weight: 700, blend: 0.5 }),
+  ]],
+  ['E. Sans D + drawn bar', 'A geometric sans D with the bar from B1: more logo, less terminal.', [
+    v('E1', 'Inter 900', '', { font: 'Inter', weight: 900, mode: 'bar', blend: 0.5 }),
+    v('E2', 'Space Grotesk 700', '', { font: 'Space Grotesk', weight: 700, mode: 'bar', blend: 0.5 }),
+    v('E3', 'Manrope 800', '', { font: 'Manrope', weight: 800, mode: 'bar', blend: 0.5 }),
+    v('E4', 'Outfit 800', '', { font: 'Outfit', weight: 800, mode: 'bar', blend: 0.5 }),
+  ]],
+  ['F. Margin', 'Size of the mark in the tile (share of the tile kept free on the wider side), half mass.', [
+    v('F1', 'Margin 14%', 'Bigger mark.', { margin: 0.14, blend: 0.5 }),
+    v('F2', 'Margin 18%', 'Today.', { margin: 0.18, blend: 0.5 }),
+    v('F3', 'Margin 22%', '', { margin: 0.22, blend: 0.5 }),
+    v('F4', 'Margin 26%', 'Close to the Windows 48 px grid content area.', { margin: 0.26, blend: 0.5 }),
+  ]],
+  ['G. Pixel snapping', 'Small frames only: the ink\'s left and top edges land on whole pixels, and the bar is drawn on whole pixels. Compare the 24 and 16 px zooms with the unsnapped versions.', [
+    v('G1', 'A1 snapped', '', { snap: true }),
+    v('G2', 'A3 snapped', '', { blend: 0.5, snap: true }),
+    v('G3', 'B1 snapped', '', { mode: 'bar', blend: 0.5, snap: true }),
+    v('G4', 'B3 snapped', '', { mode: 'bar', blend: 0.5, snap: true, bar: { w: 0.40 } }),
+  ]],
+];
+
+// Suggested picks, in order: [variant id, reason]. Reasons are from the theory above, not yet checked on a real taskbar.
+const SUGGESTED = [
+  ['A3', 'halfway to the mass: a small left and down shift that fixes the right-heavy look without moving it far.'],
+  ['A6', 'A3 lifted 2%: the mark sits a touch low, so the lift makes it read as centered.'],
+  ['B2', 'a real underscore below the baseline: still reads as D_, and the bar matches the stem.'],
+  ['G2', 'A3 with pixel snapping: keeps the edges crisp at 16 and 24 px on the taskbar.'],
+  ['F3', 'margin 22%: a little smaller, so the mark has more air in the tile.'],
+  ['C4', 'Bold 700: a bit lighter than today, opens the D without losing weight at small sizes.'],
+];
+
+// Design space: glyphs drawn at 600 px, origin (150, 700) on a 1400 x 900 raster.
+const W = 1400, H = 900, FS = 600, OX = 150, OY = 700;
+const scratch = Object.assign(document.createElement('canvas'), { width: W, height: H });
+const sctx = scratch.getContext('2d', { willReadFrequently: true });
+
+function inkOf(drawFn) {
+  sctx.setTransform(1, 0, 0, 1, 0, 0); sctx.clearRect(0, 0, W, H); sctx.fillStyle = '#000'; drawFn(sctx);
+  const d = sctx.getImageData(0, 0, W, H).data;
+  let x0 = W, y0 = H, x1 = -1, y1 = -1, sum = 0, sx = 0, sy = 0;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const a = d[(y * W + x) * 4 + 3]; if (!a) continue;
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    sum += a; sx += a * (x + 0.5); sy += a * (y + 0.5);
+  }
+  // Stem: the first solid run from the left on the middle row of the ink.
+  const my = Math.round((y0 + y1) / 2); let sx0 = -1, stem = 0;
+  for (let x = x0; x <= x1; x++) { const a = d[(my * W + x) * 4 + 3]; if (a > 127) { if (sx0 < 0) sx0 = x; stem++; } else if (sx0 >= 0) break; }
+  return { x0, y0, x1: x1 + 1, y1: y1 + 1, cx: sx / sum, cy: sy / sum, stem };
+}
+
+function build(o) {
+  const font = `${o.weight} ${FS}px "${o.font}"`;
+  const text = o.mode === 'glyph' ? 'D_' : 'D';
+  const D = inkOf(c => { c.font = font; c.fillText('D', OX, OY); });
+  let rect = null;
+  if (o.mode === 'bar') {
+    const dh = D.y1 - D.y0, dw = D.x1 - D.x0, t = o.bar.t === 'stem' ? D.stem : o.bar.t * dh;
+    const x = D.x1 + o.bar.gap * dh, w = o.bar.w * dw;
+    const y = o.bar.y === 'base' ? D.y1 - t : D.y1 + 0.06 * dh;
+    rect = [x, y, w, t];
+  }
+  const draw = c => { c.font = font; c.fillText(text, OX, OY); if (rect) c.fillRect(...rect); };
+  return { o, font, text, rect, draw, ink: inkOf(draw), D };
+}
+
+function render(m, s, guides) {
+  const { o, ink } = m;
+  const cv = document.createElement('canvas'); cv.width = cv.height = s;
+  const c = cv.getContext('2d');
+  const r = Math.max(2, s * 0.2);
+  c.fillStyle = TILE; c.beginPath(); c.roundRect(0, 0, s, s, r); c.fill();
+  const bw = ink.x1 - ink.x0, bh = ink.y1 - ink.y0;
+  const k = s * (1 - 2 * o.margin) / Math.max(bw, bh);
+  const boxX = (ink.x0 + ink.x1) / 2, boxY = (ink.y0 + ink.y1) / 2;
+  let ax = boxX + (ink.cx - boxX) * o.blend, ay = boxY + (ink.cy - boxY) * o.blend;
+  if (o.focus !== 'all') { const t = o.focus === 'D' ? 1 : 0.5; ax = boxX + ((m.D.x0 + m.D.x1) / 2 - boxX) * t; }
+  let tx = s / 2 + o.dx * s - ax * k, ty = s / 2 - o.lift * s - ay * k;
+  if (o.snap && s <= 64) { const L = ink.x0 * k + tx, T = ink.y0 * k + ty; tx += Math.round(L) - L; ty += Math.round(T) - T; }
+  c.fillStyle = INK; c.setTransform(k, 0, 0, k, tx, ty); c.font = m.font; c.fillText(m.text, OX, OY);
+  if (m.rect) {
+    let [x, y, w, h] = m.rect;
+    if (o.snap && s <= 64) {
+      c.setTransform(1, 0, 0, 1, 0, 0);
+      const X0 = Math.round(x * k + tx), Y0 = Math.round(y * k + ty), X1 = Math.round((x + w) * k + tx), Y1 = Math.max(Y0 + 1, Math.round((y + h) * k + ty));
+      c.fillRect(X0, Y0, X1 - X0, Y1 - Y0);
+    } else c.fillRect(x, y, w, h);
+  }
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  if (guides) {
+    c.lineWidth = Math.max(1, s / 256);
+    c.strokeStyle = 'rgba(0,200,255,.8)'; c.beginPath(); c.moveTo(s / 2, 0); c.lineTo(s / 2, s); c.moveTo(0, s / 2); c.lineTo(s, s / 2); c.stroke();
+    c.strokeStyle = 'rgba(255,60,60,.9)'; c.strokeRect(ink.x0 * k + tx, ink.y0 * k + ty, bw * k, bh * k);
+    c.fillStyle = '#ffd400'; c.beginPath(); c.arc(ink.cx * k + tx, ink.cy * k + ty, Math.max(2, s / 64), 0, 7); c.fill();
+  }
+  return cv;
+}
+
+// Margins as Photoshop would measure them: dark pixels on the 256 frame.
+function measure(cv) {
+  const s = cv.width, d = cv.getContext('2d').getImageData(0, 0, s, s).data;
+  let x0 = s, y0 = s, x1 = -1, y1 = -1;
+  for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+    const i = (y * s + x) * 4; if (d[i + 3] > 200 && d[i + 1] < 120) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  }
+  return `256: L ${x0}  R ${s - 1 - x1}  T ${y0}  B ${s - 1 - y1}`;
+}
+
+// A canvas shown at exactly one device pixel per canvas pixel.
+const dpr = window.devicePixelRatio || 1;
+const real = cv => { cv.style.width = cv.style.height = cv.width / dpr + 'px'; return cv; };
+const zoom = (cv, f) => { const z = cv; z.className = 'zoom'; z.style.width = z.style.height = cv.width * f + 'px'; return z; };
+
+function card(m, guides) {
+  const { o } = m;
+  const el = document.createElement('div'); el.className = 'card';
+  const ok = document.fonts.check(`${o.weight} 20px "${o.font}"`);
+  el.innerHTML = `<h3><b>${o.id}</b>${o.title}${ok ? '' : ' <span class="missing">(font missing)</span>'}</h3><div class="note">${o.note}</div>`;
+  const row = document.createElement('div'); row.className = 'row';
+  const big = render(m, 320, guides); big.className = 'big'; row.append(big);
+  const side = document.createElement('div'); side.className = 'side';
+  side.append('24 px ×4', zoom(render(m, 24), 4), '16 px ×4', zoom(render(m, 16), 4));
+  row.append(side); el.append(row);
+  for (const cls of ['dark', 'light']) {
+    const strip = document.createElement('div'); strip.className = 'strip ' + cls;
+    for (const s of [48, 32, 24, 20, 16]) strip.append(real(render(m, Math.round(s * dpr))));
+    el.append(strip);
+  }
+  const meas = document.createElement('div'); meas.className = 'meas'; meas.textContent = measure(render(m, 256)); el.append(meas);
+  return el;
+}
+
+let models = [];
+function draw() {
+  const guides = document.getElementById('guides').checked, sheet = document.getElementById('sheet');
+  sheet.innerHTML = '';
+  let i = 0;
+  for (const [title, note, list] of groups) {
+    const h = document.createElement('h2'); h.textContent = title; const p = document.createElement('p'); p.textContent = note;
+    const grid = document.createElement('div'); grid.className = 'grid';
+    for (const _ of list) grid.append(card(models[i++], guides));
+    sheet.append(h, p, grid);
+  }
+  // Suggested picks: the same models, shown again at the bottom.
+  const byId = Object.fromEntries(models.map(m => [m.o.id, m]));
+  const h = document.createElement('h2'); h.textContent = 'Suggested';
+  const p = document.createElement('p'); p.textContent = 'Start here. Six picks against today\'s icon (A1), each for one reason:';
+  const ul = document.createElement('ul');
+  const grid = document.createElement('div'); grid.className = 'grid';
+  for (const [id, why] of SUGGESTED) {
+    const li = document.createElement('li'); li.textContent = `${id}: ${why}`; ul.append(li);
+    grid.append(card(byId[id], guides));
+  }
+  sheet.append(h, p, ul, grid);
+}
+
+(async () => {
+  const all = groups.flatMap(g => g[2]);
+  await Promise.all([...new Set(all.map(o => `${o.weight} 100px "${o.font}"`))].map(f => document.fonts.load(f, 'D_').catch(() => {})));
+  models = all.map(build);
+  document.getElementById('status').textContent = `${all.length} variants. The taskbar strips are drawn at true pixels for this screen (scale ${Math.round(dpr * 100)}%).`;
+  draw();
+  document.getElementById('guides').addEventListener('change', draw);
+})();
+</script>
+</body>
+</html>
