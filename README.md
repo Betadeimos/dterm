@@ -206,8 +206,9 @@ AltGr+key types a character on your layout, that character wins, and left Ctrl +
 
 Closing the window, or going to the start page, saves the layout, each pane's folder and name, the view and the
 font size to `%APPDATA%\dterm\last.session`. `Ctrl+Alt+S` saves it under a name in
-`%APPDATA%\dterm\sessions`, and from then on saves over that file. Closing the last pane with `exit` ends dterm
-without saving.
+`%APPDATA%\dterm\sessions`, and from then on saves over that file. Closing the window with unsaved work (a session
+never saved under a name, or whose panes or layout changed since) first asks whether to save it: Yes, No or
+Cancel. Closing the last pane with `exit` ends dterm without saving.
 
 When something is saved, dterm opens on a start page: last session, a saved one (with a layout preview), or a
 new one. Arrows or mouse choose, Enter opens, `F2` renames, `Del` (twice) deletes.
