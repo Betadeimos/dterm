@@ -22,8 +22,9 @@
 //! or an OSC 133 prompt after a command), yellow waiting (a bell, or an OSC 9 / 777 notification).
 //! Panes running claude, codex, opencode or aider show the agent as a tag.
 //! Closing the window remembers the session (layout, folders, names, view, font, and the coding
-//! agent of each pane that runs one, Claude Code with its conversation); with anything saved,
-//! dterm starts on a landing page to pick a session or a new one.
+//! agent of each pane that runs one, Claude Code with its conversation), after asking to save
+//! it under its name if it never was or changed since; with anything saved, dterm starts on a
+//! landing page to pick a session or a new one.
 
 use std::{
     borrow::Cow,
@@ -917,6 +918,12 @@ fn session_text(s: &Session) -> String {
     out
 }
 
+/// The panes and their layout in `session_text` form, without the view, font, focus and times:
+/// what has to differ for a session to count as changed.
+fn layout_text(s: &Session) -> String {
+    session_text(s).lines().skip(6).collect::<Vec<_>>().join("\n")
+}
+
 /// The session in `session_text` form, or `None` when anything is off.
 fn parse_session(text: &str) -> Option<Session> {
     fn node<'a>(lines: &mut impl Iterator<Item = &'a str>, panes: &mut Vec<SavedPane>, depth: usize) -> Option<Node> {
@@ -1759,6 +1766,8 @@ struct App {
     toast: Option<String>,       // short note after saving
     created: u64,                // when this session started (Unix seconds), kept across restores
     file: Option<std::path::PathBuf>, // the saved session this window is; Save writes over it
+    clean: Option<String>,       // `layout_text` of the session as last saved or opened
+    quitting: bool,              // the save prompt was opened by closing the window: close once saved
     settings: Settings,
     page: Option<SettingsPage>,  // the settings page, shown over the panes or the landing page
     seen: bool,                  // the user has clicked or typed since the window was last deactivated; until then the focused pane counts as background
@@ -2999,6 +3008,54 @@ fn save_session(file: &std::path::Path) -> bool {
     with(|a| a.session()).is_some_and(|s| write_session(file, &s))
 }
 
+/// Save the session in `file` as a named one: the window is that session from now on, with
+/// nothing unsaved. False when there is nothing to save or writing failed.
+fn save_named(file: &std::path::Path) -> bool {
+    with(|a| {
+        let Some(s) = a.session() else { return false };
+        let saved = write_session(file, &s);
+        if saved {
+            (a.file, a.clean) = (Some(file.to_path_buf()), Some(layout_text(&s)));
+        }
+        saved
+    })
+}
+
+/// Whether closing would lose work: panes never saved under a name, or changed since.
+fn unsaved(a: &App) -> bool {
+    a.session().is_some_and(|s| a.file.is_none() || a.clean.as_deref() != Some(layout_text(&s).as_str()))
+}
+
+/// Closing the window with unsaved work asks first: Yes saves (a session without a name asks for
+/// one and closes after Enter), No closes, Cancel stays. False to stay.
+unsafe fn confirm_close(hwnd: HWND) -> bool {
+    if !with(|a| unsaved(a)) {
+        return true;
+    }
+    let file = with(|a| a.file.clone());
+    let text = match &file {
+        Some(f) => format!("Save the changes to \u{201c}{}\u{201d} before closing?", stem(f)),
+        None => "Save this session under a name before closing?".into(),
+    };
+    match MessageBoxW(Some(hwnd), PCWSTR(wide(&text).as_ptr()), w!("dterm"), MB_YESNOCANCEL | MB_ICONQUESTION) {
+        IDNO => true,
+        IDYES => match file {
+            Some(f) if save_named(&f) => true,
+            Some(_) => {
+                fail("Could not save the session");
+                false
+            }
+            None => {
+                with(|a| (a.landing, a.prompt, a.toast, a.quitting) = (None, Some((Ask::Save, String::new())), None, true));
+                layout(hwnd);
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                false
+            }
+        },
+        _ => false,
+    }
+}
+
 /// The file of the saved session called `name` (already cleaned by `session_file_name`).
 fn session_path(name: &str) -> Option<std::path::PathBuf> {
     data_dir().map(|d| d.join("sessions").join(format!("{name}.session")))
@@ -3049,6 +3106,7 @@ unsafe fn open_session(hwnd: HWND, s: Session) -> bool {
         (a.panes, a.tree, a.next_id, a.view) = (panes, Some(tree), base + s.panes.len(), s.view);
         a.focus = s.focus;
         a.created = if s.created > 0 { s.created } else { now() };
+        a.clean = Some(layout_text(&s));
         true
     });
     if opened {
@@ -3160,14 +3218,11 @@ unsafe fn save_as_new(hwnd: HWND, typed: &str) {
     }
     let note = if file.exists() {
         Some("a session with that name exists")
-    } else if !save_session(&file) {
+    } else if !save_named(&file) {
         Some("could not save the session")
     } else {
         None
     };
-    if note.is_none() {
-        with(|a| a.file = Some(file));
-    }
     go_home(hwnd); // rebuilds the rows: the old session is saved again, this one runs under its new name
     with(|a| a.landing.as_mut().map(|l| l.note = note));
 }
@@ -3417,6 +3472,7 @@ unsafe fn draw_settings(a: &App, page: &SettingsPage, rt: &ID2D1HwndRenderTarget
 /// pane, or the pane in the chosen shell.
 unsafe fn end_prompt(hwnd: HWND, keep: bool) {
     let (ask, typed) = with(|a| a.prompt.take()).unzip();
+    let quitting = with(|a| std::mem::take(&mut a.quitting));
     if let (true, Some(Ask::Shell(i))) = (keep, ask) {
         let name = with(|a| a.shells.get(i).map(|s| s.name));
         leave_zoom(hwnd);
@@ -3424,10 +3480,9 @@ unsafe fn end_prompt(hwnd: HWND, keep: bool) {
     } else if keep && ask == Some(Ask::Worktree) {
         open_worktree(hwnd, typed.unwrap_or_default().trim());
     } else if let (true, Some(name)) = (keep, typed.as_deref().and_then(session_file_name)) {
-        let file = session_path(&name).filter(|f| save_session(f));
-        let saved = file.is_some();
-        if file.is_some() {
-            with(|a| a.file = file);
+        let saved = session_path(&name).is_some_and(|f| save_named(&f));
+        if saved && quitting {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
         toast(hwnd, if saved { format!("saved \u{201c}{name}\u{201d}") } else { "could not save".into() });
     }
@@ -3613,7 +3668,7 @@ unsafe fn run(hwnd: HWND, act: Action) {
         // A session that already has a file is saved over it; a new one asks for a name.
         Action::Save => match with(|a| a.file.clone()) {
             Some(file) => {
-                let saved = save_session(&file);
+                let saved = save_named(&file);
                 toast(hwnd, if saved { format!("saved \u{201c}{}\u{201d}", stem(&file)) } else { "could not save".into() });
             }
             None => {
@@ -4161,7 +4216,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             set_accent(hwnd, 0);
             set_accent(hwnd, ACCENT_ACRYLIC);
         }
-        // Closing the window (not the last pane exiting) remembers the session.
+        // Closing the window (not the last pane exiting) asks about unsaved work, then remembers the session.
+        WM_CLOSE if !confirm_close(hwnd) => return LRESULT(0),
         WM_CLOSE => save_last(),
         WM_ENDSESSION if wp.0 != 0 => save_last(),
         WM_TIMER if wp.0 == STATUS_TIMER => {
@@ -4481,7 +4537,7 @@ fn main() {
                 select: None, click: (0, f32::MIN, f32::MIN, 0),
                 home: std::env::var("USERPROFILE").ok(), rename: None, title: "dterm".into(),
                 view: View::Grid, mouse: None, tracking: false, landing: None, prompt: None, toast: None,
-                created: now(), file: None, settings, page: None, seen: true, broadcast: false, report: None,
+                created: now(), file: None, clean: None, quitting: false, settings, page: None, seen: true, broadcast: false, report: None,
             })
         });
         let hwnd = CreateWindowExW(
@@ -4833,6 +4889,11 @@ fn check() {
     ));
     assert!(text.contains("pane \t\tclaude --resume 0a1b-2c\n")); // the command only when there is one
     assert!(text.ends_with("pane D:\\x\t\t\tGit Bash\n")); // the shell after an empty command
+    // Unsaved work is judged on the panes and layout only, not on the view, font, focus or times.
+    let moved = parse_session(&text.replace("view tabs", "view grid").replace("focus 2", "focus 0").replace("closed 1700003600", "closed 1")).unwrap();
+    assert_eq!(layout_text(&moved), layout_text(&s));
+    assert!(layout_text(&s).starts_with("split side 0.250\n"));
+    assert_ne!(layout_text(&parse_session(&text.replace("build", "test")).unwrap()), layout_text(&s));
     assert_eq!(parse_session(&text), Some(s));
     assert!(parse_session(&text.replace("\n", "\r\n")).is_some()); // Notepad line breaks
     // Leaves get renumbered in tree order, whatever their ids were.
