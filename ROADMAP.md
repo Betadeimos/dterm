@@ -23,6 +23,11 @@ shells and sessions (#13, #26, #27), look (#4, #5, #12), project (#6, #11, #22, 
 
 ## History
 
+**v0.3.4, the Prompt Icon Release**
+- New `>_` icon, the mark shared with dprep: Catppuccin Base ground, green chevron, blue cursor,
+  the colours of the classic shell prompt. The landing page logo takes the same green and blue
+  ([#35](https://github.com/Betadeimos/dterm/issues/35)).
+
 **v0.3.3, the Mixed Shells Release**
 - Ctrl+Alt+Shift+T opens a pane in any installed shell (Left / Right pick it in the prompt bar),
   so Git Bash and PowerShell panes can share a grid; sessions bring each pane back in its own shell

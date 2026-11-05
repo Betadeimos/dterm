@@ -2556,10 +2556,11 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
     // Line `y` of terminal text, vertically centered in its row.
     let line = |s: &str, x: f32, y: f32, c: u32, alpha: f32| text(s, &a.format, rect(x, y + (lh - ch) / 2.0, 4000.0, ch), c, alpha);
 
-    // The logo, as on the icon, and a tagline.
+    // The logo, in the icon's green and blue, and a tagline.
     if let Ok(big) = text_format(&a.dw, DWRITE_FONT_WEIGHT_BOLD, LOGO_SIZE) {
         let r = rect(LAND_X, LAND_Y, 4000.0, LOGO_SIZE * 1.4);
-        text("D_", &big, r, theme().ansi[2], 1.0);
+        text("D", &big, r, theme().ansi[2], 1.0);
+        text(" _", &big, r, theme().ansi[4], 1.0);
         // Monospace: right after the two cells of "D_". White, or the text color on a light theme.
         text("  term", &big, r, if light() { theme().fg } else { 0xFFFFFF }, 1.0);
     }

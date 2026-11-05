@@ -43,8 +43,8 @@ Drafts of the Reddit and Show HN posts are in `launch-posts.md` (local only, lis
 `.git/info/exclude`). Before posting, re-check every number in them against the current release.
 
 **Where things stand**
-- v0.3.3 (524,800 bytes, ~513 KB) is the release to launch with: it adds per-pane shells (#26)
-  and Ctrl+Alt+1 … 9 (#21). v0.3.2 fixed #14 (two Claude panes in
+- v0.3.4 (524,800 bytes, ~513 KB) is the release to launch with: it adds the `>_` icon (#35), on
+  top of per-pane shells (#26) and Ctrl+Alt+1 … 9 (#21) from v0.3.3. v0.3.2 fixed #14 (two Claude panes in
   one folder swapped conversations) and ships `SHA256SUMS.txt`. The README explains the
   SmartScreen warning, since the exe is not signed (#24).
 - Reddit: the account is 6 years old but has almost no karma, and r/ClaudeCode blocks posting
