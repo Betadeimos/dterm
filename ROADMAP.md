@@ -23,6 +23,14 @@ shells and sessions (#13, #26, #27), look (#4, #5, #12), project (#6, #11, #22, 
 
 ## History
 
+**v0.3.5, the Ask Before Closing Release**
+- Closing the window with unsaved work (a session never saved under a name, or whose panes or
+  layout changed since) asks first: Yes, No or Cancel
+  ([#34](https://github.com/Betadeimos/dterm/issues/34)).
+- The logo becomes `>_ dterm` in the icon's colours, the README title becomes `dterm`, and
+  `assets/social-preview.png` is ready for GitHub's social preview
+  ([#36](https://github.com/Betadeimos/dterm/issues/36)).
+
 **v0.3.4, the Prompt Icon Release**
 - New `>_` icon, the mark shared with dprep: Catppuccin Base ground, green chevron, blue cursor,
   the colours of the classic shell prompt. The landing page logo takes the same green and blue
