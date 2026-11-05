@@ -43,7 +43,7 @@ Drafts of the Reddit and Show HN posts are in `launch-posts.md` (local only, lis
 `.git/info/exclude`). Before posting, re-check every number in them against the current release.
 
 **Where things stand**
-- v0.3.5 (526,848 bytes, ~515 KB) is the release to launch with: it adds the prompt to save on
+- v0.3.6 (526,848 bytes, ~515 KB) is the release to launch with: it adds the Crust icon ground (#37), on top of the prompt to save on
   close (#34) and the `>_` brand (#35, #36), on top of per-pane shells (#26) and Ctrl+Alt+1 … 9
   (#21) from v0.3.3. v0.3.2 fixed #14 (two Claude panes in
   one folder swapped conversations) and ships `SHA256SUMS.txt`. The README explains the

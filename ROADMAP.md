@@ -23,6 +23,10 @@ shells and sessions (#13, #26, #27), look (#4, #5, #12), project (#6, #11, #22, 
 
 ## History
 
+**v0.3.6, the Crust Icon Release**
+- The >_ icon's ground is Catppuccin Crust 11111B, darker than Base. Chevron and cursor are
+  unchanged ([#37](https://github.com/Betadeimos/dterm/issues/37)).
+
 **v0.3.5, the Ask Before Closing Release**
 - Closing the window with unsaved work (a session never saved under a name, or whose panes or
   layout changed since) asks first: Yes, No or Cancel
