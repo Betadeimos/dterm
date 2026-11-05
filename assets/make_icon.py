@@ -1,6 +1,6 @@
 """Regenerate icon.ico and icon.png next to this script (stdlib only): python assets/make_icon.py
 
-The >_ mark shared with dprep: Catppuccin Base ground, green chevron, blue cursor. Green and blue
+The >_ mark shared with dprep: Catppuccin Crust ground, green chevron, blue cursor. Green and blue
 are the colours of the classic shell prompt. Then rebuild the exe's resource from the project root
 (rc.exe ships with the Windows SDK): rc.exe /fo dterm.res dterm.rc
 """
@@ -11,7 +11,7 @@ import zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
 
-GROUND = (0x1E, 0x1E, 0x2E)
+GROUND = (0x11, 0x11, 0x1B)
 ACCENT = (0xA6, 0xE3, 0xA1)
 TEXT = (0x89, 0xB4, 0xFA)
 
