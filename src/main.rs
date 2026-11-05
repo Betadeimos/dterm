@@ -2565,13 +2565,15 @@ unsafe fn draw_landing(a: &App, l: &Landing, rt: &ID2D1HwndRenderTarget, brush: 
     // Line `y` of terminal text, vertically centered in its row.
     let line = |s: &str, x: f32, y: f32, c: u32, alpha: f32| text(s, &a.format, rect(x, y + (lh - ch) / 2.0, 4000.0, ch), c, alpha);
 
-    // The logo, in the icon's green and blue, and a tagline.
+    // The logo: the icon's >_ and the name, and a tagline. Dark themes use the icon's exact green
+    // and blue; those are too pale on a light theme, which uses its own.
     if let Ok(big) = text_format(&a.dw, DWRITE_FONT_WEIGHT_BOLD, LOGO_SIZE) {
         let r = rect(LAND_X, LAND_Y, 4000.0, LOGO_SIZE * 1.4);
-        text("D", &big, r, theme().ansi[2], 1.0);
-        text(" _", &big, r, theme().ansi[4], 1.0);
-        // Monospace: right after the two cells of "D_". White, or the text color on a light theme.
-        text("  term", &big, r, if light() { theme().fg } else { 0xFFFFFF }, 1.0);
+        let (green, blue) = if light() { (theme().ansi[2], theme().ansi[4]) } else { (0xA6E3A1, 0x89B4FA) };
+        text(">", &big, r, green, 1.0);
+        text(" _", &big, r, blue, 1.0);
+        // Monospace: one cell after the two of ">_". White, or the text color on a light theme.
+        text("   dterm", &big, r, if light() { theme().fg } else { 0xFFFFFF }, 1.0);
     }
     let tagline = format!("terminals in a grid, sessions that come back  \u{b7}  v{}", env!("CARGO_PKG_VERSION"));
     let live = l.rows.iter().any(|r| r.kind == Kind::Live);
